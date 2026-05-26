@@ -1,17 +1,27 @@
 import "dotenv/config";
 import { logger } from "@utils/logger"; // 引入 logger 以便尽早初始化
-import { startRuntime } from "@utils/runtimeManager";
-import { patchMsgEdit } from "hook/listen";
+import { shutdownRuntime, startRuntime } from "@utils/runtimeManager";
 import "./hook/patches/telegram.patch";
 
-// patchMsgEdit();
+async function fatalShutdown(exitCode: number): Promise<void> {
+  if (process.env.NODE_ENV === "development" || process.env.TB_UNHANDLED_REJECTION === "warn") {
+    return;
+  }
+  const timer = setTimeout(() => process.exit(exitCode), 10_000);
+  try {
+    await shutdownRuntime();
+  } catch (error) {
+    console.error("[FATAL] Graceful shutdown failed:", error);
+  } finally {
+    clearTimeout(timer);
+    process.exit(exitCode);
+  }
+}
 
-// Global error handlers to prevent unhandled rejections and exceptions
-// from crashing the process silently. These log the error and let PM2
-// restart if needed, rather than losing all context.
 process.on("unhandledRejection", (reason: unknown) => {
   const message = reason instanceof Error ? reason.stack || reason.message : String(reason);
   console.error(`[FATAL] Unhandled promise rejection: ${message}`);
+  void fatalShutdown(1);
 });
 
 process.on("uncaughtException", (error: Error) => {

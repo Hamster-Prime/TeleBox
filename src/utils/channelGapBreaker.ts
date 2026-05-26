@@ -16,8 +16,6 @@
  * itself is not modified.
  */
 
-import { getGlobalClient } from "./globalClient";
-
 // --- Configuration -----------------------------------------------------------
 
 /** How many consecutive PTS failures before we circuit-break the channel. */
@@ -136,6 +134,10 @@ function circuitBreakChannel(channelId: string): void {
         `Cooldown: ${Math.round(BREAK_COOLDOWN_MS / 3600000)}h ` +
         `[layout=${summary.layout}]`
       );
+    } else {
+      console.warn(
+        `[CircuitBreaker] Could not find channel state for ${channelId}; teleproto layout may have changed.`
+      );
     }
 
     // Reset failure counter after breaking
@@ -245,6 +247,13 @@ function clearChannelStateOnClient(
   return { cleared, oldPts, layout };
 }
 
+export function clearChannelStateForTesting(
+  client: unknown,
+  channelId: string
+): { cleared: boolean; oldPts: number | string | null; layout: string } {
+  return clearChannelStateOnClient(client, channelId);
+}
+
 /**
  * Safely get the TelegramClient without throwing.
  * The client has _channelPts, _pendingChannelUpdates, and
@@ -252,8 +261,8 @@ function clearChannelStateOnClient(
  */
 function tryGetClient(): any | null {
   try {
-    // getGlobalClient is async, but we need sync access.
-    // Access the runtime's client directly.
+    // Access the runtime's client directly because the breaker runs from
+    // synchronous logger interceptors.
     const { tryGetCurrentRuntime } = require("./runtimeManager") as typeof import("./runtimeManager");
     const runtime = tryGetCurrentRuntime();
     if (runtime?.client) {
@@ -263,12 +272,4 @@ function tryGetClient(): any | null {
     // Runtime not available
   }
   return null;
-}
-
-/**
- * Reset the circuit breaker state. Called during runtime reload to
- * start fresh.
- */
-export function resetCircuitBreaker(): void {
-  channelFailures.clear();
 }

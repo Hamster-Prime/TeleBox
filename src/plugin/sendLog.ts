@@ -5,9 +5,12 @@ import path from "path";
 import fs from "fs/promises";
 import { SendLogDB } from "@utils/sendLogDB";
 import { Api } from "teleproto";
+import { createDirectoryInTemp } from "@utils/pathHelpers";
+import { redactSecrets } from "@utils/security";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
+const MAX_LOG_TAIL_BYTES = 512 * 1024;
 
 
 async function findLogFiles(): Promise<{
@@ -62,6 +65,25 @@ function htmlEscape(text: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+async function createRedactedTailFile(logPath: string, label: string): Promise<{ filePath: string; sizeKB: number }> {
+  const stats = await fs.stat(logPath);
+  const length = Math.min(stats.size, MAX_LOG_TAIL_BYTES);
+  const offset = Math.max(0, stats.size - length);
+  const handle = await fs.open(logPath, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, offset);
+    const redacted = String(redactSecrets(buffer.toString("utf-8")));
+    const tempDir = createDirectoryInTemp("sendlog");
+    const filePath = path.join(tempDir, `${label}-${Date.now()}.log`);
+    await fs.writeFile(filePath, redacted, { encoding: "utf-8", mode: 0o600 });
+    const tailStats = await fs.stat(filePath);
+    return { filePath, sizeKB: Math.round(tailStats.size / 1024) };
+  } finally {
+    await handle.close();
+  }
 }
 
 const fn = async (msg: Api.Message) => {
@@ -134,6 +156,7 @@ const fn = async (msg: Api.Message) => {
     return;
   }
 
+  const confirmed = parts.includes("--yes") || parts.includes("confirm");
   let target: string | number = "me";
   const db = new SendLogDB();
   target = db.getTarget();
@@ -153,6 +176,25 @@ const fn = async (msg: Api.Message) => {
       return;
     }
 
+    if (!confirmed) {
+      const rows: string[] = [];
+      for (const [label, logPath] of [
+        ["输出日志", outLog],
+        ["错误日志", errLog],
+      ] as const) {
+        if (!logPath) continue;
+        const stats = await fs.stat(logPath);
+        rows.push(`• ${label}: ${Math.round(stats.size / 1024)}KB`);
+      }
+      await msg.edit({
+        text:
+          `📋 找到日志文件\n\n${rows.join("\n")}\n\n` +
+          `为避免泄漏 session/token，默认不会发送原始日志。\n` +
+          `确认发送脱敏后的最近 ${(MAX_LOG_TAIL_BYTES / 1024).toFixed(0)}KB 内容: ${mainPrefix}sendlog --yes`,
+      });
+      return;
+    }
+
     let sentCount = 0;
     const results: string[] = [];
 
@@ -161,16 +203,18 @@ const fn = async (msg: Api.Message) => {
       try {
         const stats = await fs.stat(outLog);
         const sizeKB = Math.round(stats.size / 1024);
-        console.log(`Sending output log: ${outLog} (${sizeKB}KB) to ${target}`);
+        console.log(`Sending redacted output log tail: ${outLog} (${sizeKB}KB) to ${target}`);
 
         if (stats.size > 50 * 1024 * 1024) {
           results.push(`⚠️ 输出日志过大 (${sizeKB}KB)，已跳过`);
         } else {
+          const tail = await createRedactedTailFile(outLog, "telebox-out");
           await msg.client?.sendFile(target, {
-            file: outLog,
-            caption: `📄 输出日志 (${sizeKB}KB)\n📁 ${outLog}`,
+            file: tail.filePath,
+            caption: `📄 输出日志脱敏片段 (${tail.sizeKB}KB)\n📁 ${outLog}`,
           });
-          results.push(`✅ 输出日志已发送 (${sizeKB}KB)`);
+          await fs.unlink(tail.filePath).catch(() => undefined);
+          results.push(`✅ 输出日志脱敏片段已发送 (${tail.sizeKB}KB)`);
           sentCount++;
         }
       } catch (error: any) {
@@ -188,16 +232,18 @@ const fn = async (msg: Api.Message) => {
       try {
         const stats = await fs.stat(errLog);
         const sizeKB = Math.round(stats.size / 1024);
-        console.log(`Sending error log: ${errLog} (${sizeKB}KB) to ${target}`);
+        console.log(`Sending redacted error log tail: ${errLog} (${sizeKB}KB) to ${target}`);
 
         if (stats.size > 50 * 1024 * 1024) {
           results.push(`⚠️ 错误日志过大 (${sizeKB}KB)，已跳过`);
         } else {
+          const tail = await createRedactedTailFile(errLog, "telebox-error");
           await msg.client?.sendFile(target, {
-            file: errLog,
-            caption: `🚨 错误日志 (${sizeKB}KB)\n📁 ${errLog}`,
+            file: tail.filePath,
+            caption: `🚨 错误日志脱敏片段 (${tail.sizeKB}KB)\n📁 ${errLog}`,
           });
-          results.push(`✅ 错误日志已发送 (${sizeKB}KB)`);
+          await fs.unlink(tail.filePath).catch(() => undefined);
+          results.push(`✅ 错误日志脱敏片段已发送 (${tail.sizeKB}KB)`);
           sentCount++;
         }
       } catch (error: any) {
@@ -236,6 +282,23 @@ const fn = async (msg: Api.Message) => {
 class SendLogPlugin extends Plugin {
 
   description: string = `发送日志文件到收藏夹或自定义目标\n.sendlog set &lt;对话 ID|@用户名|me&gt; 设置发送目标 (默认 me)\n.sendlog clean 清理日志文件`;
+  commandPolicies = {
+    sendlog: {
+      risk: "dangerous" as const,
+      delegation: "owner-only" as const,
+      reason: ".sendlog can transfer sensitive log files and is restricted to the account owner.",
+    },
+    logs: {
+      risk: "dangerous" as const,
+      delegation: "owner-only" as const,
+      reason: ".logs can transfer sensitive log files and is restricted to the account owner.",
+    },
+    log: {
+      risk: "dangerous" as const,
+      delegation: "owner-only" as const,
+      reason: ".log can transfer sensitive log files and is restricted to the account owner.",
+    },
+  };
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     sendlog: fn,
     logs: fn,

@@ -27,7 +27,7 @@
   - [.env - 环境变量配置](#env---环境变量配置)
   - [package.json - 项目配置](#packagejson---项目配置)
 - [进程管理配置](#进程管理配置)
-  - [ecosystem.config.js - PM2配置](#ecosystemconfigjs---pm2配置)
+  - [ecosystem.config.cjs - PM2配置](#ecosystemconfigcjs---pm2配置)
 - [环境变量详解](#环境变量详解)
   - [命令前缀配置](#命令前缀配置)
   - [插件行为配置](#插件行为配置)
@@ -209,7 +209,7 @@ telebox/
 ├── .env                   # 环境变量配置
 ├── package.json          # 项目配置
 ├── tsconfig.json         # TypeScript配置
-└── ecosystem.config.js   # PM2进程管理配置
+└── ecosystem.config.cjs  # PM2进程管理配置
 ```
 
 ### 核心模块
@@ -218,16 +218,12 @@ telebox/
 
 ```typescript
 import "dotenv/config";
-import { login } from "@utils/loginManager";
-import { loadPlugins } from "@utils/pluginManager";
-import { patchMsgEdit } from "hook/listen";
+import { logger } from "@utils/logger";
+import { startRuntime } from "@utils/runtimeManager";
 import "./hook/patches/telegram.patch";
 
-// patchMsgEdit(); // Hook功能（当前已注释）
-
 async function run() {
-  await login();          // 登录 Telegram
-  await loadPlugins();    // 加载插件
+  await startRuntime();   // 登录 Telegram 并加载插件
 }
 
 run();
@@ -265,7 +261,7 @@ run();
 
 #### 系统插件 (plugin/)
 
-15个内置插件：
+16个内置插件：
 
 | 插件名 | 功能说明 |
 |--------|----------|
@@ -281,19 +277,18 @@ run();
 | `sendLog.ts` | 日志发送 |
 | `sudo.ts` | 权限管理 |
 | `sure.ts` | 确认操作 |
-| `sysinfo.ts` | 系统信息 |
+| `status.ts` | 系统信息与生命周期状态 |
 | `tpm.ts` | 插件包管理器 |
 | `update.ts` | 更新管理 |
+| `loglevel.ts` | 日志等级管理 |
 
 #### Hook系统 (hook/)
 
-- `listen.ts` - 消息监听器和编辑补丁（为sudo用户提供特殊消息处理）
 - `patches/` - Telegram API补丁
 - `types/` - 类型定义
 
 **特殊功能**：
-- 为sudo管理员用户提供消息编辑重定向功能
-- 可通过 `patchMsgEdit()` 启用（默认注释）
+- `telegram.patch.ts` 对 HTML parse 与安全删除方法做幂等补丁
 
 ### 目录组织
 
@@ -311,7 +306,6 @@ src/
 │   ├── alias.ts
 │   └── ...
 └── hook/                 # Hook系统
-    ├── listen.ts
     ├── patches/
     └── types/
 ```
@@ -361,8 +355,7 @@ index.ts
   │     ├── pluginBase → 插件基类
   │     ├── plugins/* → 用户插件
   │     └── src/plugin/* → 系统插件
-  └── hook/listen → 消息监听
-        └── patches → API补丁
+  └── hook/patches → API补丁
 
 utils/* (工具模块)
   ├── globalClient → Telegram客户端
@@ -857,6 +850,8 @@ const info = getTeleboxInfo(); // 获取TeleBox系统信息
 - `api_hash` - Telegram API Hash
 - `session` - 会话字符串，首次登录后自动生成
 
+`session` 等同于账号登录态。运行时会尽量将 `config.json` 权限收紧到 `0600`；生产环境也可以使用 `TB_API_ID`、`TB_API_HASH`、`TB_SESSION` 由外部 secret manager 注入，避免 session 落盘。若 session 泄漏，请立即在 Telegram「设置 → 设备」终止对应会话。
+
 #### .env - 环境变量配置
 
 **作用**：配置TeleBox运行参数
@@ -867,6 +862,11 @@ TB_PREFIX=". 。"
 
 # Sudo命令前缀（可选）
 TB_SUDO_PREFIX="# $"
+
+# Telegram API/Session 环境变量（可选）
+TB_API_ID=123456
+TB_API_HASH="0123456789abcdef0123456789abcdef"
+TB_SESSION="1A..."
 
 # 全局设置命令是否忽略编辑的消息
 TB_CMD_IGNORE_EDITED=false
@@ -882,41 +882,25 @@ TB_LISTENER_HANDLE_EDITED="sudo sure"
 ```json
 {
   "name": "telebox",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "scripts": {
-    "start": "tsx -r tsconfig-paths/register ./src/index.ts",
-    "tpm": "tsx -r tsconfig-paths/register ./src/plugin/tpm.ts",
-    "dev": "NODE_ENV=development tsx -r tsconfig-paths/register ./src/index.ts"
+    "start": "node scripts/run-tsx.cjs ./src/index.ts",
+    "tpm": "node scripts/run-tsx.cjs ./src/plugin/tpm.ts",
+    "dev": "node scripts/run-dev.cjs ./src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:plugins": "tsc -p tsconfig.plugins.json --noEmit",
+    "test": "node scripts/run-tsx.cjs ./tests/run-tests.ts",
+    "audit": "npm audit --omit=dev"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/TeleBoxOrg/TeleBox.git"
-  },
-  "license": "LGPL-2.1-only",
-  "dependencies": {
-    "telegram": "^2.26.22",
-    "dotenv": "^17.2.2",
-    "cron": "^4.3.3",
-    "axios": "^1.11.0",
-    "sharp": "^0.34.3",
-    "lowdb": "^7.0.1",
-    "lodash": "^4.17.21",
-    "dayjs": "^1.11.18",
-    "cheerio": "^1.1.2",
-    "better-sqlite3": "^12.2.0",
-    "opencc-js": "^1.0.5",
-    "modern-gif": "^2.0.4",
-    "archiver": "^7.0.1",
-    "ssh2": "^1.15.0",
-    "@vitalets/google-translate-api": "^9.2.1"
-    // 完整依赖列表见package.json
+  "engines": {
+    "node": "24.x"
   }
 }
 ```
 
 ### 进程管理配置
 
-#### ecosystem.config.js - PM2配置
+#### ecosystem.config.cjs - PM2配置
 
 **作用**：使用PM2进行进程管理和自动重启
 
@@ -925,9 +909,11 @@ module.exports = {
   apps: [
     {
       name: "telebox",
-      script: "npm",
-      args: "start",
+      script: process.execPath,
+      args: "scripts/run-tsx.cjs src/index.ts",
       cwd: __dirname,
+      exec_mode: "fork",
+      instances: 1,
       error_file: "./logs/error.log",
       out_file: "./logs/out.log",
       merge_logs: true,
@@ -1116,18 +1102,21 @@ TeleBox内置15个系统插件，位于 `src/plugin/` 目录。
 
 ### 系统管理插件
 
-#### sysinfo - 系统信息
+#### status / sysinfo - 系统信息
 
-**文件**: `src/plugin/sysinfo.ts`
+**文件**: `src/plugin/status.ts`
 
 **功能**：
 - 显示TeleBox运行状态
 - CPU、内存、磁盘使用情况
 - 系统版本信息
+- generation 生命周期资源计数
 
 **命令**：
 ```
 .sysinfo      # 显示系统信息
+.status       # 显示运行状态
+.status lifecycle  # 显示生命周期资源计数
 ```
 
 #### update - 更新管理
@@ -1167,18 +1156,20 @@ TeleBox内置15个系统插件，位于 `src/plugin/` 目录。
 
 **功能**：
 - 安装、卸载、更新插件包
-- 从NPM或Git仓库安装插件
-- 插件依赖管理
+- 从官方 TeleBox_Plugins raw GitHub 源安装插件
+- 安装/更新插件会执行插件代码，需显式 `--yes`
 - 插件搜索
 
 **命令**：
 ```
-.tpm i [插件名]           # 安装插件
+.tpm i [插件名] --yes     # 安装插件
 .tpm rm [插件名]          # 卸载插件
 .tpm ls                   # 列出已安装插件
 .tpm search [关键词]      # 搜索插件
-.tpm update [插件名]      # 更新插件
+.tpm update --yes         # 更新已安装插件
 ```
+
+sudo/sure 委托用户默认不能执行安装、更新、清空插件目录等危险子命令。
 
 ### 开发工具插件
 
@@ -1218,14 +1209,15 @@ TeleBox内置15个系统插件，位于 `src/plugin/` 目录。
 **文件**: `src/plugin/sendLog.ts`
 
 **功能**：
-- 发送系统日志文件
-- 查看错误日志
+- 预览系统日志元数据
+- 发送脱敏后的最近日志片段
 - 调试问题
 
 **命令**：
 ```
-.log          # 发送日志文件
-.errlog       # 发送错误日志
+.sendlog          # 预览日志元数据
+.sendlog --yes    # 发送脱敏后的最近日志片段
+.sendlog clean    # 清理日志
 ```
 
 ### 实用工具插件
@@ -2220,9 +2212,8 @@ const caption = MessageFormatter.buildHtml([
    - 这是源代码中的实际拼写，请保持一致
 
 2. **Hook系统状态**
-   - `patchMsgEdit()` 功能当前已注释
-   - 为sudo用户提供消息编辑重定向功能
-   - 需要时可手动启用
+   - 旧的 `patchMsgEdit()` 死代码已移除
+   - 当前只保留启动时自动加载的幂等 Telegram API 补丁
 
 3. **环境变量默认值**
    - `TB_CMD_IGNORE_EDITED` 默认为 "true"

@@ -90,11 +90,12 @@ sudo 权限分配和用户管理
 │   ├── 🔌 plugin/             # 内置插件目录
 │   │   ├── 📖 help.ts         # 帮助系统
 │   │   ├── 📦 tpm.ts          # 插件管理器
-│   │   ├── 🆔 id.ts           # 信息查询
+│   │   ├── 🆔 debug.ts        # 信息查询与调试
 │   │   ├── 👑 sudo.ts         # 权限管理
 │   │   ├── 💻 exec.ts         # Shell 执行
 │   │   ├── 🏓 ping.ts         # 网络测试
-│   │   ├── 📊 sysinfo.ts      # 系统信息
+│   │   ├── 📊 status.ts       # 系统信息与生命周期状态
+│   │   ├── 🔊 loglevel.ts     # 日志等级
 │   │   └── 🔧 ...             # 其他内置插件
 │   └── 🛠️ utils/              # 工具库
 │       ├── ⚙️ pluginManager.ts     # 插件管理核心
@@ -292,16 +293,18 @@ abstract class Plugin {
 </div>
 
 > 🔍 **查看可用插件** → `.tpm search` / `.tpm s`  
-> 📥 **安装插件** → `.tpm install <插件名>` / `.tpm i <插件名>`  
-> 📦 **批量安装** → `.tpm i <插件1> <插件2> <插件3>`  
-> 🌟 **一键安装全部** → `.tpm i all`  
+> 📥 **安装插件** → `.tpm install <插件名> --yes` / `.tpm i <插件名> --yes`
+> 📦 **批量安装** → `.tpm i <插件1> <插件2> <插件3> --yes`
+> 🌟 **一键安装全部** → `.tpm i all --yes`
 > 📁 **从文件安装** → 回复文件 + `.tpm install`  
 > 🗑️ **卸载插件** → `.tpm remove <插件名>` / `.tpm rm <插件名>`  
 > 🗂️ **批量卸载** → `.tpm rm <插件1> <插件2> <插件3>`  
-> 🔄 **一键更新全部** → `.tpm update` / `.tpm ua`  
+> 🔄 **一键更新全部** → `.tpm update --yes` / `.tpm ua --yes`
 > 📋 **查看已安装** → `.tpm list` / `.tpm ls`  
 > 📊 **详细列表** → `.tpm list -v` / `.tpm lv`  
 > 📤 **上传插件** → `.tpm upload <插件名>` / `.tpm ul <插件名>`
+
+> ⚠️ 安装或更新插件等同于执行插件作者提供的代码。插件可以访问你的 Telegram 账号上下文和主机文件；只安装可信来源，且 sudo/sure 委托用户默认不能执行 `.exec`、危险 `.tpm`、`.update`、`.sendlog`、`.prefix`、`.bf all` 等命令。
 
 <div align="center">
 
@@ -322,8 +325,6 @@ abstract class Plugin {
 |   💾 **数据库**    |        lowdb         |   `7.0.1`   |
 |  ⚡ **构建工具**   | tsx + tsconfig-paths |  `latest`   |
 | 🌐 **HTTP 客户端** |        axios         |  `1.11.0`   |
-|  🖼️ **图像处理**   |        sharp         |  `0.34.3`   |
-|   🧰 **工具库**    |        lodash        |  `4.17.21`  |
 |  ⏰ **任务调度**   |         cron         |   `4.3.3`   |
 
 </div>
@@ -359,7 +360,7 @@ abstract class Plugin {
 
 ```bash
 .tpm search              # 🔍 查看远程插件列表
-.tpm i <插件名>          # 📥 安装插件
+.tpm i <插件名> --yes    # 📥 安装插件
 .sudo add <用户>         # 👑 添加 sudo 权限
 ```
 
@@ -373,7 +374,7 @@ abstract class Plugin {
 
 ```bash
 # 🚀 启动开发模式
-NODE_ENV=development tpm run dev
+npm run dev
 ```
 
 💡 _开发模式下使用_ `!` _和_ `！` _作为命令前缀_

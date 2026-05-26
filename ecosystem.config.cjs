@@ -31,15 +31,6 @@ function pickPrefixedEnv(source, prefixes) {
   );
 }
 
-function parseInstances(value) {
-  if (value === 'max') {
-    return 'max';
-  }
-
-  const parsed = Number.parseInt(value || '1', 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : 1;
-}
-
 const baseEnvFile = readEnvFile(path.join(root, '.env'));
 const runtimeEnv = process.env.NODE_ENV || baseEnvFile.NODE_ENV || 'production';
 const modeEnvFile = readEnvFile(path.join(root, `.env.${runtimeEnv}`));
@@ -52,8 +43,8 @@ const effectiveEnv = {
   ...process.env,
 };
 const logDir = effectiveEnv.PM2_LOG_DIR || path.join(root, 'logs');
-const execMode = effectiveEnv.PM2_EXEC_MODE === 'cluster' ? 'cluster' : 'fork';
-const instances = parseInstances(effectiveEnv.PM2_INSTANCES);
+const execMode = 'fork';
+const instances = 1;
 
 fs.mkdirSync(logDir, { recursive: true });
 
@@ -98,4 +89,3 @@ module.exports = {
     },
   ],
 };
-

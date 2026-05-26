@@ -10,6 +10,7 @@ import { promisify } from "util";
 import { JSONFilePreset } from "lowdb/node";
 import { getCurrentGenerationContext } from "@utils/globalClient";
 import { reloadRuntime } from "@utils/runtimeManager";
+import { isLikelySupervisedProcess } from "@utils/security";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
@@ -29,6 +30,8 @@ const exitFile = path.join(exitDir, "msg.json");
 const assetsDir = createDirectoryInAssets("reload");
 const configPath = path.join(assetsDir, "config.json");
 const pendingExitTimers = new Set<ReturnType<typeof setTimeout>>();
+let configPromise: Promise<any> | null = null;
+let configWriteQueue: Promise<void> = Promise.resolve();
 
 async function updateReloadStatus(params: {
   client: Api.Message["client"];
@@ -69,17 +72,27 @@ interface ReloadConfig {
 }
 
 async function initConfig() {
-  const db = await JSONFilePreset<ReloadConfig>(configPath, {
-    leakfixEnabled: false,
-    memoryThreshold: 150,
-    rssThreshold: 512,
-    runtimeGrowthThreshold: 120,
-    baselineHeapUsed: null,
-    baselineRss: null,
-    baselineMode: "on-enable",
-    silentEnabled: false
-  });
-  return db;
+  if (configPromise) return await configPromise;
+  configPromise = JSONFilePreset<ReloadConfig>(configPath, {
+      leakfixEnabled: false,
+      memoryThreshold: 150,
+      rssThreshold: 512,
+      runtimeGrowthThreshold: 120,
+      baselineHeapUsed: null,
+      baselineRss: null,
+      baselineMode: "on-enable",
+      silentEnabled: false
+    })
+    .then((db) => {
+      const originalWrite = db.write.bind(db);
+      db.write = async () => {
+        const write = configWriteQueue.then(() => originalWrite());
+        configWriteQueue = write.catch(() => undefined);
+        await write;
+      };
+      return db;
+    });
+  return await configPromise;
 }
 
 function formatMb(value: number | null | undefined): string {
@@ -94,7 +107,7 @@ function updateMemoryBaseline(config: ReloadConfig, memory: ReturnType<typeof ge
 
 function formatBaselineMode(mode: ReloadConfig["baselineMode"]): string {
   if (mode === "manual") return "手动";
-  if (mode === "on-reload") return "每次重载后自动更新";
+  if (mode === "on-reload") return "每次重载后重置基线（会弱化跨重载增长检测）";
   return "开启时自动记录";
 }
 
@@ -181,6 +194,24 @@ function scheduleTrackedTimeout(
   }, delay, { label: "reload:scheduled-timeout" });
   pendingExitTimers.add(timer);
   return timer;
+}
+
+async function requestProcessRestart(client: Api.Message["client"] | undefined, text: string): Promise<void> {
+  if (!isLikelySupervisedProcess()) {
+    console.warn("[Memory Monitor] Process is not supervised; skip automatic process exit.");
+    if (client) {
+      await client.sendMessage("me", {
+        message:
+          `${text}\n\n` +
+          `⚠️ 未检测到 PM2/systemd 等 supervisor，已跳过自动退出。请手动重启 TeleBox。`,
+        parseMode: "html",
+      }).catch((error) => {
+        console.error("[Memory Monitor] Failed to send unsupervised warning:", error);
+      });
+    }
+    return;
+  }
+  scheduleTrackedTimeout(() => process.exit(0), 1000);
 }
 
 const editExitMsg = async () => {
@@ -320,7 +351,7 @@ async function memoryMonitorTask() {
               parseMode: "html"
             });
           }
-          scheduleTrackedTimeout(() => process.exit(0), 1000);
+          await requestProcessRestart(runtime.client, "⚠️ <b>Memory优化</b>\n\nRuntime 重建后内存仍超限。");
         } else if (!config.silentEnabled) {
           await runtime.client.sendMessage("me", {
             message:
@@ -344,7 +375,7 @@ async function memoryMonitorTask() {
             parseMode: "html"
           });
         }
-        scheduleTrackedTimeout(() => process.exit(0), 1000);
+        await requestProcessRestart(client, "⚠️ <b>Memory优化</b>\n\n自动重建 Runtime 失败。");
       }
     } else {
       console.log(

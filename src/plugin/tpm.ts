@@ -1,4 +1,4 @@
-import { Plugin, isValidPlugin } from "@utils/pluginBase";
+import { Plugin } from "@utils/pluginBase";
 import { loadPlugins } from "@utils/pluginManager";
 import {
   createDirectoryInTemp,
@@ -12,6 +12,12 @@ import { safeGetReplyMessage } from "@utils/safeGetMessages";
 import { JSONFilePreset } from "lowdb/node";
 import { getPrefixes } from "@utils/pluginManager";
 import { tryGetCurrentGenerationContext } from "@utils/globalClient";
+import {
+  isAllowedRemotePluginUrl,
+  safePluginFilePath,
+  safeUploadedPluginFileName,
+  validatePluginId,
+} from "@utils/security";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
@@ -19,6 +25,9 @@ const MAX_MESSAGE_LENGTH = 4000;
 const PLUGINS_INDEX_URL =
   "https://raw.githubusercontent.com/TeleBoxDev/TeleBox_Plugins/main/plugins.json";
 const REQUEST_TIMEOUT_MS = 20000;
+const MAX_PLUGIN_BYTES = 512 * 1024;
+const MAX_INDEX_BYTES = 1024 * 1024;
+const MAX_BATCH_PLUGINS = 100;
 const MAX_RETRIES = 4;
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 const DEFAULT_HEADERS = {
@@ -37,6 +46,8 @@ type RemotePluginInfo = { url: string; desc?: string };
 type RemotePluginsIndex = Record<string, RemotePluginInfo>;
 
 const PLUGIN_PATH = path.join(process.cwd(), "plugins");
+let databasePromise: Promise<any> | null = null;
+let databaseWriteQueue: Promise<void> = Promise.resolve();
 
 class EntityManager {
   private count = 0;
@@ -163,6 +174,13 @@ function splitLongText(text: string, maxLength: number = MAX_MESSAGE_LENGTH): st
   return messages;
 }
 
+function isPlausiblePluginSource(source: string): boolean {
+  return (
+    /\bcmdHandlers\b/.test(source) &&
+    (/\bexport\s+default\b/.test(source) || /\bmodule\.exports\b/.test(source))
+  );
+}
+
 async function sendLongMessage(
   msg: Api.Message,
   text: string,
@@ -214,14 +232,37 @@ async function sendLongMessage(
 }
 
 async function getDatabase() {
+  if (databasePromise) {
+    return await databasePromise;
+  }
   const filePath = path.join(createDirectoryInAssets("tpm"), "plugins.json");
-  const db = await JSONFilePreset<Database>(filePath, {});
-  return db;
+  databasePromise = JSONFilePreset<Database>(filePath, {}).then((db) => {
+    for (const key of Object.keys(db.data)) {
+      try {
+        validatePluginId(key);
+      } catch {
+        delete db.data[key];
+      }
+    }
+    return db;
+  });
+  return await databasePromise;
+}
+
+async function writeDatabase(db: { write: () => Promise<void> }): Promise<void> {
+  const write = databaseWriteQueue.then(() => db.write());
+  databaseWriteQueue = write.catch(() => undefined);
+  await write;
 }
 
 async function getMediaFileName(msg: any): Promise<string> {
   const metadata = msg.media as any;
-  return metadata.document.attributes[0].fileName;
+  const attrs = metadata?.document?.attributes || [];
+  const attr = attrs.find((item: any) => typeof item?.fileName === "string");
+  if (!attr?.fileName) {
+    throw new Error("无法读取插件文件名");
+  }
+  return attr.fileName;
 }
 
 function normalizeGithubUrl(input: string): string {
@@ -282,11 +323,19 @@ async function fetchWithRetry<T>(
 ) {
   let lastError: unknown;
   const normalizedUrl = normalizeGithubUrl(url);
+  const maxBytes =
+    normalizedUrl === PLUGINS_INDEX_URL ? MAX_INDEX_BYTES : MAX_PLUGIN_BYTES;
+  if (normalizedUrl !== PLUGINS_INDEX_URL && !isAllowedRemotePluginUrl(normalizedUrl)) {
+    throw new Error(`Rejected untrusted plugin URL: ${normalizedUrl}`);
+  }
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       return await axios.get<T>(normalizedUrl, {
-        timeout: REQUEST_TIMEOUT_MS,
         ...options,
+        timeout: REQUEST_TIMEOUT_MS,
+        maxContentLength: maxBytes,
+        maxBodyLength: maxBytes,
+        maxRedirects: 0,
         headers: {
           ...DEFAULT_HEADERS,
           ...(options?.headers || {}),
@@ -306,23 +355,30 @@ async function fetchWithRetry<T>(
 }
 
 async function installRemotePlugin(plugin: string, msg: Api.Message) {
-  const statusMsg = await sendOrEditMessage(msg, `正在安装插件 ${plugin}...`);
+  let pluginId: string;
+  try {
+    pluginId = validatePluginId(plugin);
+  } catch (error) {
+    await sendOrEditMessage(msg, `❌ 插件名称无效: ${htmlEscape(plugin)}`, { parseMode: "html" });
+    return;
+  }
+  const statusMsg = await sendOrEditMessage(msg, `正在安装插件 ${pluginId}...`);
   const res = await fetchWithRetry<RemotePluginsIndex>(PLUGINS_INDEX_URL);
   if (res.status === 200) {
-    if (!res.data[plugin]) {
-      await sendOrEditMessage(statusMsg, `未找到插件 ${plugin} 的远程资源`);
+    if (!res.data[pluginId]) {
+      await sendOrEditMessage(statusMsg, `未找到插件 ${pluginId} 的远程资源`);
       return;
     }
-    const pluginUrl = normalizeGithubUrl(res.data[plugin].url);
+    const pluginUrl = normalizeGithubUrl(res.data[pluginId].url);
     const response = await fetchWithRetry<string>(pluginUrl, {
       responseType: "text",
     });
     if (response.status !== 200) {
-      await sendOrEditMessage(statusMsg, `无法下载插件 ${plugin}`);
+      await sendOrEditMessage(statusMsg, `无法下载插件 ${pluginId}`);
       return;
     }
-    const filePath = path.join(PLUGIN_PATH, `${plugin}.ts`);
-    const oldBackupPath = path.join(PLUGIN_PATH, `${plugin}.ts.backup`);
+    const filePath = safePluginFilePath(PLUGIN_PATH, pluginId);
+    const oldBackupPath = `${filePath}.backup`;
 
     if (fs.existsSync(filePath)) {
       const cacheDir = createDirectoryInTemp("plugin_backups");
@@ -330,7 +386,7 @@ async function installRemotePlugin(plugin: string, msg: Api.Message) {
         .toISOString()
         .replace(/[:.]/g, "-")
         .slice(0, -5);
-      const backupPath = path.join(cacheDir, `${plugin}_${timestamp}.ts.bak`);
+      const backupPath = path.join(cacheDir, `${pluginId}_${timestamp}.ts.bak`);
       fs.copyFileSync(filePath, backupPath);
       console.log(`[TPM] 旧插件已转移到缓存: ${backupPath}`);
     }
@@ -344,14 +400,14 @@ async function installRemotePlugin(plugin: string, msg: Api.Message) {
 
     try {
       const db = await getDatabase();
-      db.data[plugin] = { ...res.data[plugin], _updatedAt: Date.now() };
-      await db.write();
-      console.log(`[TPM] 已记录插件信息到数据库: ${plugin}`);
+      db.data[pluginId] = { ...res.data[pluginId], url: pluginUrl, _updatedAt: Date.now() };
+      await writeDatabase(db);
+      console.log(`[TPM] 已记录插件信息到数据库: ${pluginId}`);
     } catch (error) {
       console.error(`[TPM] 记录插件信息失败: ${error}`);
     }
 
-    await sendOrEditMessage(statusMsg, `插件 ${plugin} 已安装并加载成功`);
+    await sendOrEditMessage(statusMsg, `插件 ${pluginId} 已安装并加载成功`);
     await loadPlugins();
   } else {
     await sendOrEditMessage(statusMsg, `无法获取远程插件库`);
@@ -367,10 +423,22 @@ async function installAllPlugins(msg: Api.Message) {
       return;
     }
 
-    const plugins = Object.keys(res.data);
+    const plugins = Object.keys(res.data)
+      .map((plugin) => {
+        try {
+          return validatePluginId(plugin);
+        } catch {
+          return null;
+        }
+      })
+      .filter((plugin): plugin is string => Boolean(plugin));
     const totalPlugins = plugins.length;
     if (totalPlugins === 0) {
       await sendOrEditMessage(statusMsg, "📦 远程插件库为空");
+      return;
+    }
+    if (totalPlugins > MAX_BATCH_PLUGINS) {
+      await sendOrEditMessage(statusMsg, `❌ 远程插件数量 ${totalPlugins} 超过安全上限 ${MAX_BATCH_PLUGINS}`);
       return;
     }
 
@@ -408,8 +476,8 @@ async function installAllPlugins(msg: Api.Message) {
           continue;
         }
 
-        const filePath = path.join(PLUGIN_PATH, `${plugin}.ts`);
-        const oldBackupPath = path.join(PLUGIN_PATH, `${plugin}.ts.backup`);
+        const filePath = safePluginFilePath(PLUGIN_PATH, plugin);
+        const oldBackupPath = `${filePath}.backup`;
 
         if (fs.existsSync(filePath)) {
           const cacheDir = createDirectoryInTemp("plugin_backups");
@@ -435,7 +503,7 @@ async function installAllPlugins(msg: Api.Message) {
             desc: pluginData.desc,
             _updatedAt: Date.now(),
           };
-          await db.write();
+          await writeDatabase(db);
           console.log(`[TPM] 已记录插件信息到数据库: ${plugin}`);
         } catch (dbError) {
           console.error(`[TPM] 记录插件信息失败: ${dbError}`);
@@ -476,9 +544,23 @@ async function installAllPlugins(msg: Api.Message) {
 }
 
 async function installMultiplePlugins(pluginNames: string[], msg: Api.Message) {
+  const requestedPluginNames = pluginNames;
+  pluginNames = pluginNames
+    .map((pluginName) => {
+      try {
+        return validatePluginId(pluginName);
+      } catch {
+        return null;
+      }
+    })
+    .filter((pluginName): pluginName is string => Boolean(pluginName));
   const totalPlugins = pluginNames.length;
   if (totalPlugins === 0) {
-    await sendOrEditMessage(msg, "❌ 未提供要安装的插件名称");
+    await sendOrEditMessage(msg, `❌ 未提供有效插件名称: ${requestedPluginNames.map(htmlEscape).join(", ")}`, { parseMode: "html" });
+    return;
+  }
+  if (totalPlugins > MAX_BATCH_PLUGINS) {
+    await sendOrEditMessage(msg, `❌ 一次最多安装 ${MAX_BATCH_PLUGINS} 个插件`);
     return;
   }
 
@@ -533,8 +615,8 @@ async function installMultiplePlugins(pluginNames: string[], msg: Api.Message) {
           continue;
         }
 
-        const filePath = path.join(PLUGIN_PATH, `${pluginName}.ts`);
-        const oldBackupPath = path.join(PLUGIN_PATH, `${pluginName}.ts.backup`);
+        const filePath = safePluginFilePath(PLUGIN_PATH, pluginName);
+        const oldBackupPath = `${filePath}.backup`;
 
         if (fs.existsSync(filePath)) {
           const cacheDir = createDirectoryInTemp("plugin_backups");
@@ -564,7 +646,7 @@ async function installMultiplePlugins(pluginNames: string[], msg: Api.Message) {
             desc: pluginData.desc,
             _updatedAt: Date.now(),
           };
-          await db.write();
+          await writeDatabase(db);
           console.log(`[TPM] 已记录插件信息到数据库: ${pluginName}`);
         } catch (dbError) {
           console.error(`[TPM] 记录插件信息失败: ${dbError}`);
@@ -623,8 +705,21 @@ function generateProgressBar(percentage: number, length: number = 20): string {
 }
 
 async function installPlugin(args: string[], msg: Api.Message) {
-  if (args.length === 1) {
+  const confirmed = args.includes("--yes") || args.includes("-y") || args.includes("confirm");
+  const pluginNames = args
+    .slice(1)
+    .filter((arg) => !["--yes", "-y", "confirm"].includes(arg));
+
+  if (pluginNames.length === 0) {
     if (msg.isReply) {
+      if (!confirmed) {
+        await sendOrEditMessage(
+          msg,
+          `⚠️ 安装本地插件文件会执行该文件中的代码，等同于信任插件作者访问你的 Telegram 账号和主机文件。\n\n确认继续请使用 ${codeTag(`${mainPrefix}tpm ${args[0]} --yes`)}`,
+          { parseMode: "html" }
+        );
+        return;
+      }
       const replied = await safeGetReplyMessage(msg);
       if (replied?.media) {
         const fileName = await getMediaFileName(replied);
@@ -634,39 +729,59 @@ async function installPlugin(args: string[], msg: Api.Message) {
           return;
         }
         
-        const pluginName = fileName.replace(".ts", "");
+        let pluginName: string;
+        let safeFileName: string;
+        try {
+          const safeName = safeUploadedPluginFileName(fileName);
+          pluginName = safeName.pluginId;
+          safeFileName = safeName.fileName;
+        } catch {
+          await sendOrEditMessage(msg, `❌ 文件名无效\n仅支持 a-z、0-9、_、- 组成的 .ts 插件文件`);
+          return;
+        }
         const statusMsg = await sendOrEditMessage(msg, `🔍 正在验证插件 ${pluginName} ...`);
-        const filePath = path.join(PLUGIN_PATH, fileName);
+        const quarantineDir = createDirectoryInTemp("plugin_quarantine");
+        const quarantinePath = path.join(
+          quarantineDir,
+          `${Date.now()}_${safeFileName}`
+        );
+        const filePath = safePluginFilePath(PLUGIN_PATH, pluginName);
 
-        await msg.client?.downloadMedia(replied, { outputFile: filePath });
+        await msg.client?.downloadMedia(replied, { outputFile: quarantinePath });
         
         try {
-          const pluginModule = require(filePath);
-          const pluginInstance = pluginModule.default || pluginModule;
-          
-          if (!isValidPlugin(pluginInstance)) {
-            if (fs.existsSync(filePath)) {
-              fs.unlinkSync(filePath);
-            }
+          const stats = fs.statSync(quarantinePath);
+          if (stats.size > MAX_PLUGIN_BYTES) {
+            throw new Error(`插件文件过大，最大 ${(MAX_PLUGIN_BYTES / 1024).toFixed(0)}KB`);
+          }
+          const source = fs.readFileSync(quarantinePath, "utf-8");
+          if (!isPlausiblePluginSource(source)) {
             await sendOrEditMessage(statusMsg, `❌ 插件验证失败\n文件不是有效插件`);
             return;
           }
         } catch (error) {
-          if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
+          if (fs.existsSync(quarantinePath)) {
+            try {
+              fs.unlinkSync(quarantinePath);
+            } catch {}
           }
           await sendOrEditMessage(statusMsg, `❌ 插件加载失败\n错误信息:\n${error instanceof Error ? error.message : String(error)}`);
           return;
+        } finally {
+          // The quarantine file is moved only after validation; validation itself
+          // never require()s user code.
         }
 
         await sendOrEditMessage(statusMsg, `✅ 验证通过，正在安装插件 ${pluginName} ...`);
+        fs.copyFileSync(quarantinePath, filePath);
+        fs.unlinkSync(quarantinePath);
 
         let overrideMessage = "";
         try {
           const db = await getDatabase();
           if (db.data[pluginName]) {
             delete db.data[pluginName];
-            await db.write();
+            await writeDatabase(db);
             overrideMessage = `\n⚠️ 已覆盖之前已安装的远程插件\n若需保持更新, 请 ${codeTag(`${mainPrefix}tpm i ${pluginName}`)}`;
             console.log(`[TPM] 已从数据库中清除同名插件记录: ${pluginName}`);
           }
@@ -683,7 +798,15 @@ async function installPlugin(args: string[], msg: Api.Message) {
       await sendOrEditMessage(msg, "请回复某个插件文件或提供 tpm 包名");
     }
   } else {
-    const pluginNames = args.slice(1);
+    if (!confirmed) {
+      const requested = pluginNames.length > 0 ? pluginNames.join(" ") : "插件";
+      await sendOrEditMessage(
+        msg,
+        `⚠️ 安装 ${codeTag(requested)} 会下载并执行插件代码，等同于信任插件作者访问你的 Telegram 账号和主机文件。\n\n确认继续请使用 ${codeTag(`${mainPrefix}tpm ${args[0]} ${requested} --yes`)}`,
+        { parseMode: "html" }
+      );
+      return;
+    }
 
     if (pluginNames.length === 1 && pluginNames[0] === "all") {
       await installAllPlugins(msg);
@@ -700,23 +823,30 @@ async function uninstallPlugin(plugin: string, msg: Api.Message) {
     await sendOrEditMessage(msg, "请提供要卸载的插件名称");
     return;
   }
-  const statusMsg = await sendOrEditMessage(msg, `正在卸载插件 ${plugin}...`);
-  const pluginPath = path.join(PLUGIN_PATH, `${plugin}.ts`);
+  let pluginId: string;
+  try {
+    pluginId = validatePluginId(plugin);
+  } catch {
+    await sendOrEditMessage(msg, `❌ 插件名称无效: ${htmlEscape(plugin)}`, { parseMode: "html" });
+    return;
+  }
+  const statusMsg = await sendOrEditMessage(msg, `正在卸载插件 ${pluginId}...`);
+  const pluginPath = safePluginFilePath(PLUGIN_PATH, pluginId);
   if (fs.existsSync(pluginPath)) {
     fs.unlinkSync(pluginPath);
     try {
       const db = await getDatabase();
-      if (db.data[plugin]) {
-        delete db.data[plugin];
-        await db.write();
-        console.log(`[TPM] 已从数据库中删除插件记录: ${plugin}`);
+      if (db.data[pluginId]) {
+        delete db.data[pluginId];
+        await writeDatabase(db);
+        console.log(`[TPM] 已从数据库中删除插件记录: ${pluginId}`);
       }
     } catch (error) {
       console.error(`[TPM] 删除插件数据库记录失败: ${error}`);
     }
-    await sendOrEditMessage(statusMsg, `插件 ${plugin} 已卸载`);
+    await sendOrEditMessage(statusMsg, `插件 ${pluginId} 已卸载`);
   } else {
-    await sendOrEditMessage(statusMsg, `未找到插件 ${plugin}`);
+    await sendOrEditMessage(statusMsg, `未找到插件 ${pluginId}`);
   }
   await loadPlugins();
 }
@@ -742,18 +872,20 @@ async function uninstallMultiplePlugins(
     const db = await getDatabase();
 
     for (const pluginName of pluginNames) {
-      const trimmedName = pluginName.trim();
-      if (!trimmedName) {
+      let trimmedName: string;
+      try {
+        trimmedName = validatePluginId(pluginName);
+      } catch {
         results.push({
           name: pluginName,
           success: false,
-          reason: "插件名称为空",
+          reason: "插件名称无效",
         });
         processedCount++;
         continue;
       }
 
-      const pluginPath = path.join(PLUGIN_PATH, `${trimmedName}.ts`);
+      const pluginPath = safePluginFilePath(PLUGIN_PATH, trimmedName);
 
       if (fs.existsSync(pluginPath)) {
         try {
@@ -789,7 +921,7 @@ async function uninstallMultiplePlugins(
         )} ${processedCount}/${totalCount}\n当前: ${trimmedName}`);
     }
 
-    await db.write();
+    await writeDatabase(db);
   } catch (error) {
     console.error(`[TPM] 批量卸载过程中发生错误:`, error);
     await sendOrEditMessage(msg, `批量卸载过程中发生错误: ${
@@ -857,7 +989,7 @@ async function uninstallAllPlugins(msg: Api.Message) {
     try {
       const db = await getDatabase();
       for (const k of Object.keys(db.data)) delete db.data[k];
-      await db.write();
+      await writeDatabase(db);
     } catch (e) {
       console.error("[TPM] 清空数据库失败:", e);
     }
@@ -883,12 +1015,19 @@ async function uninstallAllPlugins(msg: Api.Message) {
 }
 
 async function uploadPlugin(args: string[], msg: Api.Message) {
-  const pluginName = args[1];
-  if (!pluginName) {
+  const inputName = args[1];
+  if (!inputName) {
     await sendOrEditMessage(msg, "请提供插件名称");
     return;
   }
-  const pluginPath = path.join(PLUGIN_PATH, `${pluginName}.ts`);
+  let pluginName: string;
+  try {
+    pluginName = validatePluginId(inputName);
+  } catch {
+    await sendOrEditMessage(msg, `❌ 插件名称无效: ${htmlEscape(inputName)}`, { parseMode: "html" });
+    return;
+  }
+  const pluginPath = safePluginFilePath(PLUGIN_PATH, pluginName);
   if (!fs.existsSync(pluginPath)) {
     await sendOrEditMessage(msg, `未找到插件 ${pluginName}`);
     return;
@@ -1150,7 +1289,7 @@ async function showPluginRecords(msg: Api.Message, verbose?: boolean) {
       const nameTag = allowCodeTag ? codeTag(name) : htmlEscape(name);
       
       if (verbose) {
-        const filePath = path.join(PLUGIN_PATH, `${name}.ts`);
+        const filePath = safePluginFilePath(PLUGIN_PATH, name);
         let mtime = "未知";
         try {
           const stat = fs.statSync(filePath);
@@ -1246,9 +1385,18 @@ async function updateAllPlugins(msg: Api.Message) {
             }/${totalPlugins} (${progress}%)\n✅ 成功: ${updatedCount}\n⏭️ 跳过: ${skipCount}\n❌ 失败: ${failedCount}`, { parseMode: "html" });
         }
 
+        let pluginId: string;
+        try {
+          pluginId = validatePluginId(pluginName);
+        } catch {
+          skipCount++;
+          console.log(`[TPM] 跳过更新插件 ${pluginName}: 插件名称无效`);
+          continue;
+        }
+
         if (!pluginRecord.url) {
           skipCount++;
-          console.log(`[TPM] 跳过更新插件 ${pluginName}: 无URL记录`);
+          console.log(`[TPM] 跳过更新插件 ${pluginId}: 无URL记录`);
           continue;
         }
 
@@ -1258,22 +1406,22 @@ async function updateAllPlugins(msg: Api.Message) {
         );
         if (response.status !== 200) {
           failedCount++;
-          failedPlugins.push(`${pluginName} (下载失败)`);
+          failedPlugins.push(`${pluginId} (下载失败)`);
           continue;
         }
 
-        const filePath = path.join(PLUGIN_PATH, `${pluginName}.ts`);
+        const filePath = safePluginFilePath(PLUGIN_PATH, pluginId);
 
         if (!fs.existsSync(filePath)) {
           skipCount++;
-          console.log(`[TPM] 跳过更新插件 ${pluginName}: 本地文件不存在`);
+          console.log(`[TPM] 跳过更新插件 ${pluginId}: 本地文件不存在`);
           continue;
         }
 
         const currentContent = fs.readFileSync(filePath, "utf8");
         if (currentContent === response.data) {
           skipCount++;
-          console.log(`[TPM] 跳过更新插件 ${pluginName}: 内容无变化`);
+          console.log(`[TPM] 跳过更新插件 ${pluginId}: 内容无变化`);
           continue;
         }
 
@@ -1282,7 +1430,7 @@ async function updateAllPlugins(msg: Api.Message) {
           .toISOString()
           .replace(/[:.]/g, "-")
           .slice(0, -5);
-        const backupPath = path.join(cacheDir, `${pluginName}_${timestamp}.ts`);
+        const backupPath = path.join(cacheDir, `${pluginId}_${timestamp}.ts`);
         fs.copyFileSync(filePath, backupPath);
         console.log(`[TPM] 旧版本已备份到: ${backupPath}`);
 
@@ -1290,7 +1438,7 @@ async function updateAllPlugins(msg: Api.Message) {
 
         try {
           db.data[pluginName]._updatedAt = Date.now();
-          await db.write();
+          await writeDatabase(db);
           console.log(`[TPM] 已更新插件数据库记录: ${pluginName}`);
         } catch (dbError) {
           console.error(`[TPM] 更新插件数据库记录失败: ${dbError}`);
@@ -1349,13 +1497,15 @@ class TpmPlugin extends Plugin {
 • <code>${mainPrefix}tpm ls -v</code> 或 <code>${mainPrefix}tpm lv</code> - 查看详细记录
 
 <b>⬇️ 安装插件:</b>
-• <code>${mainPrefix}tpm i [插件名]</code> (别名: <code>install</code>) - 安装单个插件
-• <code>${mainPrefix}tpm i [插件名1] [插件名2]</code> - 安装多个插件
-• <code>${mainPrefix}tpm i all</code> - 一键安装全部远程插件
+• <code>${mainPrefix}tpm i [插件名] --yes</code> (别名: <code>install</code>) - 安装单个插件
+• <code>${mainPrefix}tpm i [插件名1] [插件名2] --yes</code> - 安装多个插件
+• <code>${mainPrefix}tpm i all --yes</code> - 一键安装全部远程插件
 • <code>${mainPrefix}tpm i</code> (回复插件文件) - 安装本地插件文件
 
 <b>🔄 更新插件:</b>
-• <code>${mainPrefix}tpm update</code> (别名: <code>updateAll</code>, <code>ua</code>) - 一键更新所有已安装的远程插件
+• <code>${mainPrefix}tpm update --yes</code> (别名: <code>updateAll</code>, <code>ua</code>) - 一键更新所有已安装的远程插件
+
+⚠️ 安装/更新插件会执行插件作者提供的代码，等同于信任其访问你的 Telegram 账号和主机文件。
 
 <b>🗑️ 卸载插件:</b>
 • <code>${mainPrefix}tpm rm [插件名]</code> (别名: <code>remove</code>, <code>uninstall</code>, <code>un</code>) - 卸载单个插件
@@ -1366,6 +1516,23 @@ class TpmPlugin extends Plugin {
 • <code>${mainPrefix}tpm upload [插件名]</code> (别名: <code>ul</code>) - 上传指定插件文件`;
 
   ignoreEdited: boolean = true;
+  commandPolicies = {
+    tpm: {
+      blockedSubcommands: [
+        "install",
+        "i",
+        "update",
+        "updateall",
+        "ua",
+        "remove all",
+        "rm all",
+        "uninstall all",
+        "un all",
+      ],
+      reason:
+        "TPM install/update/remove-all changes executable plugin code and is restricted to the account owner.",
+    },
+  };
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     tpm: async (msg) => {
@@ -1407,6 +1574,10 @@ class TpmPlugin extends Plugin {
           ["-v", "--verbose"].includes(args[1]) || cmd === "lv"
         );
       } else if (cmd === "update" || cmd === "updateAll" || cmd === "ua") {
+        if (!args.includes("--yes") && !args.includes("-y") && !args.includes("confirm")) {
+          await sendOrEditMessage(msg, `⚠️ 更新远程插件会下载并执行插件代码。确认继续请使用 ${codeTag(`${mainPrefix}tpm ${cmd} --yes`)}`, { parseMode: "html" });
+          return;
+        }
         await updateAllPlugins(msg);
       } else {
         await sendOrEditMessage(msg, `❌ 未知命令: ${codeTag(cmd)}\n\n${this.description}`, { parseMode: "html" });
@@ -1417,16 +1588,47 @@ class TpmPlugin extends Plugin {
 
 export default new TpmPlugin();
 
+async function installRemotePluginsCli(pluginNames: string[]): Promise<void> {
+  if (pluginNames.length === 0) {
+    throw new Error("No plugin names provided.");
+  }
+  const res = await fetchWithRetry<RemotePluginsIndex>(PLUGINS_INDEX_URL);
+  if (res.status !== 200) {
+    throw new Error("Unable to fetch remote plugin index.");
+  }
+  const db = await getDatabase();
+  for (const name of pluginNames) {
+    const pluginId = validatePluginId(name);
+    const info = res.data[pluginId];
+    if (!info?.url) {
+      throw new Error(`Plugin not found: ${pluginId}`);
+    }
+    const pluginUrl = normalizeGithubUrl(info.url);
+    const response = await fetchWithRetry<string>(pluginUrl, {
+      responseType: "text",
+    });
+    if (response.status !== 200) {
+      throw new Error(`Unable to download plugin: ${pluginId}`);
+    }
+    const filePath = safePluginFilePath(PLUGIN_PATH, pluginId);
+    fs.writeFileSync(filePath, response.data);
+    db.data[pluginId] = {
+      url: pluginUrl,
+      desc: info.desc,
+      _updatedAt: Date.now(),
+    };
+    console.log(`Installed ${pluginId} -> ${filePath}`);
+  }
+  await writeDatabase(db);
+}
+
 if (require.main === module) {
   const args = process.argv.slice(2);
   if (args.length === 0 || args?.[0] !== "install" || args?.length < 2) {
     console.log("Usage: node tpm.ts install plugin1 plugin2 ...");
+    process.exit(args.length === 0 ? 0 : 1);
   }
-  installPlugin(args, {
-    edit: async ({ text }: any) => {
-      console.log(text);
-    },
-  } as any)
+  installRemotePluginsCli(args.slice(1))
     .then(() => {
       console.log("Plugins processed successfully");
     })

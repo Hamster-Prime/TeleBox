@@ -6,7 +6,7 @@
 
 [![Node.js](https://img.shields.io/badge/Node.js-24.x-green.svg?style=for-the-badge&logo=node.js)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/License-LGPL--2.1-blue?style=for-the-badge)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey?style=for-the-badge)](#)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%20best--effort-lightgrey?style=for-the-badge)](#)
 
 </div>
 
@@ -28,6 +28,7 @@
 </div>
 
 > 📝 **说明：** 以下步骤适用于 **Debian / Ubuntu** 系统，其他发行版或 macOS 请根据平台调整包管理命令（如 `yum` / `brew`）。
+> Windows 为 best-effort 支持：需确保 Node.js 24、原生模块构建工具链可用；`.bf` / `.hf` 备份恢复依赖 `tar`/`gzip` 兼容工具（如 bsdtar 或 Git Bash PATH），建议先在 PowerShell/cmd.exe 做启动烟测。
 
 ### 🔧 **步骤 1：更新并安装基础工具**
 
@@ -111,12 +112,12 @@ git clone https://github.com/TeleBoxOrg/TeleBox.git .
 
 ```bash
 # 📥 安装所有项目依赖
-npm install
+npm ci
 ```
 
 **🔄 安装过程说明：**
 
-- 自动下载并安装 `package.json` 中定义的所有依赖
+- 按 `package-lock.json` 可重复安装项目依赖
 - 安装完成后生成 `node_modules/` 目录
 
 **⏱️ 预计耗时：** 2-5 分钟（取决于网络速度）
@@ -173,6 +174,8 @@ npm start
    ```
    > 🎉 看到此消息表示登录成功，按 `CTRL+C` 停止
 
+> 🔐 `config.json` 会保存 Telegram StringSession，泄漏后等同于泄漏账号登录态。程序会尽量将权限收紧到 `0600`；也可以改用 `TB_API_ID`、`TB_API_HASH`、`TB_SESSION` 环境变量由外部 secret manager 注入。若 session 泄漏，请立即在 Telegram「设置 → 设备」中终止对应会话。
+
 </details>
 
 ### ⚙️ **步骤 6：生产环境部署**
@@ -191,7 +194,7 @@ npm install -g pm2
 
 ```bash
 # 使用 PM2 启动服务
-pm2 start "npm start" --name telebox
+pm2 start ecosystem.config.cjs
 
 # 保存 PM2 配置
 pm2 save
@@ -225,8 +228,10 @@ pm2 stop telebox
 
 - `pm2 list` - 📋 查看所有进程
 - `pm2 monit` - 📊 实时监控面板
-- `pm2 reload telebox` - 🔄 无缝重载
+- `pm2 restart telebox` - 🔄 重启服务
 - `pm2 delete telebox` - 🗑️ 删除进程
+
+> ⚠️ TeleBox 是 Telegram UserBot，默认 PM2 配置固定为 `fork` + `instances: 1`。不要用 cluster/max instances 共用同一个 `config.json`/session；多账号部署必须使用独立目录、独立配置和独立 PM2 app 名称。
 
 </details>
 

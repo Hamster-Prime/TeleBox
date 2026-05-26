@@ -196,6 +196,8 @@ class TeleBoxSystemMonitor extends Plugin {
 
   description = `显示系统信息与TeleBox运行状态\n\n${HELP_TEXT}`;
   private db: any;
+  private dbPromise: Promise<any> | null = null;
+  private writeQueue: Promise<void> = Promise.resolve();
   private readonly PLUGIN_NAME = "status";
   private readonly DB_PATH: string;
 
@@ -211,13 +213,22 @@ class TeleBoxSystemMonitor extends Plugin {
   // 初始化数据库
   private async initDB(): Promise<void> {
     try {
-      this.db = await JSONFilePreset(this.DB_PATH, {
-        template: DEFAULT_TEMPLATE,
-      });
+      if (!this.dbPromise) {
+        this.dbPromise = JSONFilePreset(this.DB_PATH, {
+          template: DEFAULT_TEMPLATE,
+        });
+      }
+      this.db = await this.dbPromise;
     } catch (error) {
       console.error(`[${this.PLUGIN_NAME}] 数据库初始化失败:`, error);
       throw new Error(`数据库初始化失败: ${error instanceof Error ? error.message : '未知错误'}`);
     }
+  }
+
+  private async writeDB(): Promise<void> {
+    const write = this.writeQueue.then(() => this.db.write());
+    this.writeQueue = write.catch(() => undefined);
+    await write;
   }
 
   // ==================== 命令处理器 ====================
@@ -495,7 +506,7 @@ class TeleBoxSystemMonitor extends Plugin {
     if (!this.db) await this.initDB();
 
     this.db.data.template = replyMsg.text;
-    await this.db.write();
+    await this.writeDB();
 
     await msg.edit({
       text: "✅ 模板已保存！使用 <code>${mainPrefix}status</code> 查看效果",
@@ -507,7 +518,7 @@ class TeleBoxSystemMonitor extends Plugin {
   private async handleResetTemplate(msg: Api.Message): Promise<void> {
     if (!this.db) await this.initDB();
     this.db.data.template = DEFAULT_TEMPLATE;
-    await this.db.write();
+    await this.writeDB();
     await msg.edit({
       text: "✅ 模板已重置为默认！",
       parseMode: "html",
@@ -631,7 +642,7 @@ Scan Time: ${scanTime}ms
       const prettyName = osRelease.match(/PRETTY_NAME="([^"]+)"/)?.[1] || "Debian GNU/Linux";
       return `${prettyName} ${arch}`;
     } catch {
-      return `Debian GNU/Linux 13 (trixie) ${arch}`;
+      return `Linux ${arch}`;
     }
   }
 
@@ -640,7 +651,7 @@ Scan Time: ${scanTime}ms
       const kernel = this.safeExec("uname -r").trim();
       return `Linux ${kernel}`;
     } catch {
-      return "Linux 6.12.41+deb13-arm64";
+      return "Unknown";
     }
   }
 
@@ -649,7 +660,7 @@ Scan Time: ${scanTime}ms
       const count = this.safeExec("dpkg -l | grep '^ii' | wc -l").trim();
       return `${count} (dpkg)`;
     } catch {
-      return "763 (dpkg)";
+      return "Unknown";
     }
   }
 
@@ -674,7 +685,7 @@ Scan Time: ${scanTime}ms
 
       return "Unknown";
     } catch {
-      return "systemd 257.7-1";
+      return "Unknown";
     }
   }
 
@@ -765,23 +776,16 @@ Scan Time: ${scanTime}ms
   // ==================== 资源监控 ====================
   private async getCpuUsage(): Promise<string> {
     try {
-      const platform = os.platform();
-      if (platform === "win32") {
-        const result = this.safeExec('wmic cpu get loadpercentage /value');
-        const match = result.match(/LoadPercentage=(\d+)/);
-        return match ? parseFloat(match[1]).toFixed(2) : "0.00";
-      } else {
-        const cpus = os.cpus();
-        let totalIdle = 0, totalTick = 0;
-        cpus.forEach((cpu) => {
-          for (const type in cpu.times) {
-            totalTick += cpu.times[type as keyof typeof cpu.times];
-          }
-          totalIdle += cpu.times.idle;
-        });
-        const usage = Math.round((1 - totalIdle / totalTick) * 100 * 100) / 100;
-        return usage.toFixed(2);
-      }
+      const cpus = os.cpus();
+      let totalIdle = 0, totalTick = 0;
+      cpus.forEach((cpu) => {
+        for (const type in cpu.times) {
+          totalTick += cpu.times[type as keyof typeof cpu.times];
+        }
+        totalIdle += cpu.times.idle;
+      });
+      const usage = Math.round((1 - totalIdle / totalTick) * 100 * 100) / 100;
+      return usage.toFixed(2);
     } catch {
       return "0.00";
     }
@@ -803,6 +807,9 @@ Scan Time: ${scanTime}ms
   }
 
   private async getProcessCount(): Promise<string> {
+    if (os.platform() === "win32") {
+      return "Unsupported";
+    }
     try {
       const count = this.safeExec("ps aux | wc -l").trim();
       return (parseInt(count) - 1).toString();

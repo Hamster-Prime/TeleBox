@@ -12,6 +12,9 @@ function buildCleanNpmEnv(): NodeJS.ProcessEnv {
       delete env[key];
     }
   }
+  delete env.NPM_CONFIG_PREFIX;
+  delete env.npm_config_prefix;
+  delete env.NODE_OPTIONS;
 
   return env;
 }

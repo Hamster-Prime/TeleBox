@@ -5,6 +5,8 @@ import { RPCError } from "teleproto/errors";
 import { safeGetMessages, safeGetReplyMessage } from "@utils/safeGetMessages";
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
+const MAX_REPLAY_MESSAGES = 10;
+const MAX_REPLAY_REPEAT = 5;
 
 class RePlugin extends Plugin {
 
@@ -17,6 +19,18 @@ class RePlugin extends Plugin {
       const [, ...args] = msg.text.slice(1).split(" ");
       const count = parseInt(args[0]) || 1;
       const repeat = parseInt(args[1]) || 1;
+      if (
+        count < 1 ||
+        repeat < 1 ||
+        count > MAX_REPLAY_MESSAGES ||
+        repeat > MAX_REPLAY_REPEAT ||
+        count * repeat > MAX_REPLAY_MESSAGES * MAX_REPLAY_REPEAT
+      ) {
+        await msg.edit({
+          text: `复读数量过大。最多 ${MAX_REPLAY_MESSAGES} 条消息、重复 ${MAX_REPLAY_REPEAT} 次。`,
+        });
+        return;
+      }
 
       try {
         if (!msg.isReply) {

@@ -1,20 +1,37 @@
 import { Plugin } from "@utils/pluginBase";
 import { getPrefixes } from "@utils/pluginManager";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import { Api } from "teleproto";
 import { npm_install_project_dependencies } from "@utils/npm_install";
-import { reloadRuntime } from "@utils/runtimeManager";
 import { getGlobalClient } from "@utils/globalClient";
+import { isLikelySupervisedProcess } from "@utils/security";
 
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+async function git(args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd: process.cwd(),
+    timeout: 120_000,
+    windowsHide: true,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  return stdout;
+}
+
+function validateGitName(value: string, label: string): string {
+  if (!/^[A-Za-z0-9._/-]{1,128}$/.test(value) || value.includes("..") || value.startsWith("-")) {
+    throw new Error(`Invalid git ${label}: ${value}`);
+  }
+  return value;
+}
 
 async function getRemotes(): Promise<string[]> {
   try {
-    const { stdout } = await execAsync("git remote");
+    const stdout = await git(["remote"]);
     return stdout.trim().split("\n").filter((r) => r.trim());
   } catch {
     return [];
@@ -23,7 +40,7 @@ async function getRemotes(): Promise<string[]> {
 
 async function getBranches(): Promise<string[]> {
   try {
-    const { stdout } = await execAsync("git branch -r");
+    const stdout = await git(["branch", "-r"]);
     const branches = stdout
       .trim()
       .split("\n")
@@ -70,53 +87,38 @@ async function update(force = false, msg: Api.Message) {
       throw new Error("未找到可用的远程分支 (main/master)。请确保已配置 git remote。");
     }
 
-    const { remote, branch } = branchInfo;
+    const remote = validateGitName(branchInfo.remote, "remote");
+    const branch = validateGitName(branchInfo.branch, "branch");
     const fullBranch = `${remote}/${branch}`;
 
-    await execAsync("git fetch --all");
+    await git(["fetch", "--all"]);
     await msg.edit({ text: "🔄 正在拉取最新代码..." });
 
     if (force) {
       console.log(`⚠️ 强制回滚到 ${fullBranch}...`);
-      await execAsync(`git reset --hard ${fullBranch}`);
+      await git(["reset", "--hard", fullBranch]);
       await msg.edit({ text: "🔄 强制更新中..." });
     }
 
-    await execAsync(`git pull ${remote} ${branch} --no-rebase`);
+    await git(["pull", remote, branch, "--no-rebase"]);
     await msg.edit({ text: "🔄 正在合并最新代码..." });
 
     console.log("\n📦 安装依赖...");
     await msg.edit({ text: "📦 正在安装依赖..." });
     npm_install_project_dependencies();
 
-    console.log("\n✅ 更新完成。");
-    await msg.edit({ text: "✅ 更新完成！正在重新加载插件..." });
-
-    const targetChat = msg.chatId || msg.peerId;
-    const targetMessageId = msg.id;
-
-    // 使用 reloadRuntime 而非 loadPlugins，确保完整的 lifecycle abort+drain+dispose 语义
-    const updateStartTime = Date.now();
-    const runtime = await reloadRuntime();
-    const updateTime = Date.now() - updateStartTime;
-    const timeText = updateTime > 1000 ? `${(updateTime / 1000).toFixed(2)}s` : `${updateTime}ms`;
-
     console.log("✅ 更新完成。");
-    try {
-      await runtime.client.editMessage(targetChat, {
-        message: targetMessageId,
-        text: `✅ 更新完成，耗时 ${timeText}`,
-      });
-    } catch (editError) {
-      console.error("Failed to update message after reload:", editError);
-      try {
-        await runtime.client.sendMessage(targetChat, {
-          message: `✅ 更新完成，耗时 ${timeText}`,
-        });
-      } catch (sendError) {
-        console.error("Failed to send completion message after reload:", sendError);
-      }
+    if (isLikelySupervisedProcess()) {
+      await msg.edit({ text: "✅ 更新完成。依赖或原生模块可能已变化，正在重启进程..." });
+      const timer = setTimeout(() => process.exit(0), 800);
+      if (typeof timer.unref === "function") timer.unref();
+      return;
     }
+    await msg.edit({
+      text:
+        "✅ 更新完成。\n\n" +
+        "依赖或原生模块可能已变化，当前未检测到 PM2/systemd 等 supervisor。请手动重启 TeleBox 后再继续使用。",
+    });
   } catch (error: any) {
     console.error("❌ 更新失败:", error);
 
@@ -152,6 +154,13 @@ async function update(force = false, msg: Api.Message) {
 
 class UpdatePlugin extends Plugin {
   description: string = `更新项目：拉取最新代码并安装依赖\n<code>${mainPrefix}update -f/-force</code> 强制更新`;
+  commandPolicies = {
+    update: {
+      risk: "dangerous" as const,
+      delegation: "owner-only" as const,
+      reason: ".update changes the working tree and dependencies and is restricted to the account owner.",
+    },
+  };
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     update: async (msg) => {
       const args = msg.message.slice(1).split(" ").slice(1);

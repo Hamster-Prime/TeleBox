@@ -8,7 +8,6 @@ import {
   loadPluginsForRuntime,
   unloadPluginsForRuntime,
 } from "./pluginManager";
-import { resetCircuitBreaker } from "./channelGapBreaker";
 
 import {
   createGenerationContext,
@@ -83,6 +82,10 @@ function cloneEmptyDrainStats(stats: GenerationResourceStats): GenerationResourc
     cloned[kind as keyof GenerationResourceStats] = { ...value };
   }
   return cloned;
+}
+
+function isTerminalContextState(state: GenerationContextSnapshot["state"]): boolean {
+  return state === "disposed" || state === "disposed-with-residuals";
 }
 
 async function withTimeout<T>(
@@ -161,8 +164,6 @@ async function buildRuntime(): Promise<TeleBoxRuntime> {
 }
 
 async function startFreshRuntime(): Promise<TeleBoxRuntime> {
-  // Reset channel gap circuit-breaker state for the new runtime
-  resetCircuitBreaker();
   const runtime = await buildRuntime();
   currentRuntime = runtime;
   try {
@@ -212,9 +213,12 @@ async function disposeRuntime(
   runtime: TeleBoxRuntime,
   reason: string
 ): Promise<DrainResult> {
-  if (runtime.context.state === "disposed") {
+  if (isTerminalContextState(runtime.context.state)) {
     console.log(`[RUNTIME] Generation ${runtime.generation} already disposed before ${reason}.`);
-    await destroyClient(runtime.client);
+    await destroyClient(runtime.client).catch((error) => {
+      runtime.state = "failed";
+      console.error(`[RUNTIME] Failed to destroy already-disposed generation ${runtime.generation} client:`, error);
+    });
     return {
       completed: true,
       timedOut: false,
@@ -234,7 +238,10 @@ async function disposeRuntime(
     await destroyClient(runtime.client);
   } catch (error) {
     console.error(`[RUNTIME] Failed to destroy generation ${runtime.generation} client:`, error);
-    throw error;
+    runtime.state = "failed";
+    if (currentRuntime === runtime) {
+      currentRuntime = null;
+    }
   }
   return drainResult;
 }
@@ -320,7 +327,7 @@ export async function reloadRuntime(): Promise<TeleBoxRuntime> {
       await disposeRuntime(oldRuntime, "Runtime reload");
     } catch (error) {
       oldRuntime.state = "failed";
-      throw error;
+      console.error("[RUNTIME] Old runtime disposal failed; continuing with a fresh runtime:", error);
     }
 
     const newRuntime = await buildRuntime();

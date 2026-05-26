@@ -4,7 +4,8 @@ export type GenerationLifecycleState =
   | "active"
   | "aborting"
   | "draining"
-  | "disposed";
+  | "disposed"
+  | "disposed-with-residuals";
 
 export type GenerationResourceKind =
   | "abort-token"
@@ -185,14 +186,13 @@ export class GenerationContext {
   }
 
   abort(reason?: unknown): void {
-    if (this.lifecycleState === "disposed") return;
+    if (this.isTerminalState()) return;
     this.abortCause = reason;
     if (this.lifecycleState === "active") {
       this.lifecycleState = "aborting";
     }
     if (!this.abortController.signal.aborted) {
       this.abortController.abort(reason);
-      this.markResourcesCanceled();
     }
   }
 
@@ -367,17 +367,18 @@ export class GenerationContext {
   }
 
   async drain(timeoutMs = DEFAULT_DRAIN_TIMEOUT_MS): Promise<DrainResult> {
-    if (this.lifecycleState === "disposed") {
+    if (this.isTerminalState()) {
+      const residualResources = this.getResidualResources();
       return {
-        completed: true,
+        completed: residualResources.length === 0 && this.tasks.size === 0 && this.disposables.size === 0,
         timedOut: false,
         errors: [],
-        pendingTasks: 0,
-        pendingDisposables: 0,
+        pendingTasks: this.tasks.size,
+        pendingDisposables: this.disposables.size,
         canceledResources: this.sumStats("canceled"),
         drainedResources: this.sumStats("completed"),
         timedOutResources: this.sumStats("timedOut"),
-        residualResources: [],
+        residualResources,
         stats: cloneStats(this.stats),
       };
     }
@@ -396,9 +397,9 @@ export class GenerationContext {
         entry.resource.state = "disposing";
         try {
           await entry.dispose();
-          this.completeResource(entry.resource, "completed");
+          this.completeResource(entry.resource, this.signal.aborted ? "canceled" : "completed");
         } catch (error) {
-          this.completeResource(entry.resource, "completed");
+          this.completeResource(entry.resource, this.signal.aborted ? "canceled" : "completed");
           errors.push(error);
           console.error(`[GENERATION ${this.generation}] Disposable "${entry.resource.label}" failed:`, error);
         }
@@ -419,6 +420,8 @@ export class GenerationContext {
       for (const entry of this.tasks) {
         this.markResourceTimedOut(entry.resource);
       }
+      this.lifecycleState = "disposed-with-residuals";
+      this.completeAbortToken();
     } else {
       this.lifecycleState = "disposed";
       this.completeAbortToken();
@@ -473,13 +476,6 @@ export class GenerationContext {
     this.stats[resource.kind].timedOut += 1;
   }
 
-  private markResourcesCanceled(): void {
-    for (const resource of this.resources.values()) {
-      if (resource.kind === "abort-token") continue;
-      this.stats[resource.kind].canceled += 1;
-    }
-  }
-
   private completeAbortToken(): void {
     const abortToken = [...this.resources.values()].find((resource) => resource.kind === "abort-token");
     if (abortToken) {
@@ -500,6 +496,13 @@ export class GenerationContext {
 
   private sumStats(key: keyof Pick<ResourceStats, "canceled" | "completed" | "timedOut">): number {
     return RESOURCE_KINDS.reduce((sum, kind) => sum + this.stats[kind][key], 0);
+  }
+
+  private isTerminalState(): boolean {
+    return (
+      this.lifecycleState === "disposed" ||
+      this.lifecycleState === "disposed-with-residuals"
+    );
   }
 }
 

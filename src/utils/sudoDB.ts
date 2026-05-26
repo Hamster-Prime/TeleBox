@@ -1,6 +1,7 @@
-import Database from "better-sqlite3";
+import type Database from "better-sqlite3";
 import { createDirectoryInAssets } from "./pathHelpers";
 import path from "path";
+import { openSharedDatabase } from "./sqlite";
 
 interface UserRecord {
   uid: number;
@@ -18,7 +19,7 @@ class SudoDB {
   constructor(
     dbPath: string = path.join(createDirectoryInAssets("sudo"), "sudo.db")
   ) {
-    this.db = new Database(dbPath);
+    this.db = openSharedDatabase(dbPath);
     this.init();
   }
 
@@ -129,7 +130,7 @@ class SudoDB {
    * 关闭数据库
    */
   public close(): void {
-    this.db.close();
+    // Shared per-process handle; closed on process exit.
   }
 }
 

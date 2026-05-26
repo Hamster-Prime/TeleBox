@@ -1,9 +1,10 @@
 import { JSONFilePreset } from "lowdb/node";
+import type { Low } from "lowdb";
 import { createDirectoryInAssets } from "@utils/pathHelpers";
 import * as path from "path";
 import dayjs from "dayjs";
-import util from "util";
 import { recordChannelGapFailure, isChannelCircuitBroken } from "@utils/channelGapBreaker";
+import { inspectRedacted } from "@utils/security";
 
 export enum LogLevel {
   DEBUG = 0,
@@ -33,10 +34,10 @@ const COLORS = {
 const ANSI_REGEX = /\x1b\[[0-9;]*m/g;
 
 class Logger {
-  private db: any = null;
+  private db: Low<LoggerConfig> | null = null;
   private level: LogLevel = LogLevel.INFO;
   private readonly DB_NAME = "logger";
-  private context: Record<string, any> = {};
+  private context: Record<string, unknown> = {};
 
   // Rate-limiting for known-spammy Telegram RPC errors to reduce log noise
   // Key: error pattern (e.g., channel ID), Value: last log timestamp
@@ -50,7 +51,7 @@ class Logger {
   private static originalError = console.error;
   private static isOverridden = false;
 
-  constructor(context: Record<string, any> = {}) {
+  constructor(context: Record<string, unknown> = {}) {
     this.context = context;
     // 只有主 Logger 实例才需要覆写控制台和加载 DB
     if (Object.keys(context).length === 0) {
@@ -60,7 +61,7 @@ class Logger {
   }
 
   // 创建带有特定上下文的子日志实例
-  public child(context: Record<string, any>): Logger {
+  public child(context: Record<string, unknown>): Logger {
     const childLogger = new Logger({ ...this.context, ...context });
     // 子 Logger 共享主 Logger 的等级
     childLogger.level = this.level; 
@@ -77,7 +78,7 @@ class Logger {
     this.level = this.db.data.level;
   }
 
-  private formatLog(level: string, args: any[], forceLevel: boolean = false): string {
+  private formatLog(level: string, args: unknown[], forceLevel: boolean = false): string {
     const timestamp = dayjs().format("YYYY-MM-DD HH:mm:ss.SSS");
     
     // 颜色映射
@@ -98,17 +99,16 @@ class Logger {
 
     // 处理消息内容和错误对象（先保留原始字符串数组以便做GramJS匹配）
     const stringArgs: string[] = args
-      .filter(a => typeof a === 'string')
-      .map(a => a as string);
+      .filter((a): a is string => typeof a === 'string');
 
     let msgParts = args.map(arg => {
       if (arg instanceof Error) {
-        return `${COLORS.red}${arg.stack || arg.message}${COLORS.reset}`;
+        return `${COLORS.red}${inspectRedacted(arg)}${COLORS.reset}`;
       }
       if (typeof arg === 'object') {
-        return util.inspect(arg, { colors: true, depth: null, breakLength: Infinity });
+        return inspectRedacted(arg);
       }
-      return String(arg);
+      return inspectRedacted(arg);
     });
     
     // 尝试获取调用者信息
@@ -196,10 +196,10 @@ class Logger {
   }
 
   // 从原始 console 参数中尝试推断 GramJS 的日志等级（若存在）
-  private detectGramJsLevel(args: any[]): "DEBUG" | "INFO " | "WARN " | "ERROR" | null {
+  private detectGramJsLevel(args: unknown[]): "DEBUG" | "INFO " | "WARN " | "ERROR" | null {
     const stringArgs: string[] = args
-      .filter(a => typeof a === 'string')
-      .map(a => (a as string).replace(ANSI_REGEX, ""));
+      .filter((a): a is string => typeof a === 'string')
+      .map((a) => a.replace(ANSI_REGEX, ""));
     if (stringArgs.length === 0) return null;
     const joined = stringArgs.join(' ');
     const gramJsRegex = /\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\]\s*\[(\w+)\]\s*-\s*(.*)$/;
@@ -218,16 +218,16 @@ class Logger {
   private overrideConsole() {
     if (Logger.isOverridden) return;
 
-    console.debug = (...args: any[]) => {
+    console.debug = (...args: unknown[]) => {
       if (this.level <= LogLevel.DEBUG) {
         Logger.originalDebug(this.formatLog("DEBUG", args));
       }
     };
 
-    console.log = (...args: any[]) => {
+    console.log = (...args: unknown[]) => {
       // Downgrade known non-actionable Telegram RPC errors from ERROR to WARN
       // teleproto uses console.log for all log levels including errors
-      const msg = args.map(a => typeof a === 'string' ? a : (a instanceof Error ? a.message + ' ' + a.stack : (a?.message ? String(a.message) : ''))).join(' ');
+      const msg = this.argsToMessage(args);
       if (this.isChannelGapFailure(msg)) {
         const channelId = this.extractChannelId(msg);
         const rateKey = channelId ? `pts_err:${channelId}` : 'pts_err:unknown';
@@ -252,7 +252,7 @@ class Logger {
       }
     };
     
-    console.info = (...args: any[]) => {
+    console.info = (...args: unknown[]) => {
       if (this.level <= LogLevel.INFO) {
         const derived = this.detectGramJsLevel(args);
         const lvl = derived ?? "INFO ";
@@ -260,10 +260,10 @@ class Logger {
       }
     };
 
-    console.warn = (...args: any[]) => {
+    console.warn = (...args: unknown[]) => {
       // Downgrade known non-actionable Telegram RPC errors (e.g. "difference too long")
       // that arrive via console.warn, same as the console.log/console.error paths
-      const msg = args.map(a => typeof a === 'string' ? a : (a instanceof Error ? a.message + ' ' + a.stack : (a?.message ? String(a.message) : ''))).join(' ');
+      const msg = this.argsToMessage(args);
       if (this.isChannelGapFailure(msg)) {
         const channelId = this.extractChannelId(msg);
         const rateKey = channelId ? `pts_err:${channelId}` : 'pts_err:unknown';
@@ -286,10 +286,10 @@ class Logger {
       }
     };
 
-    console.error = (...args: any[]) => {
+    console.error = (...args: unknown[]) => {
       // Downgrade known non-actionable Telegram RPC errors from ERROR to WARN
       // to prevent log spam from infinite retry loops on stale channel pts
-      const msg = args.map(a => typeof a === 'string' ? a : (a instanceof Error ? a.message + ' ' + a.stack : (a?.message ? String(a.message) : ''))).join(' ');
+      const msg = this.argsToMessage(args);
       if (this.isChannelGapFailure(msg)) {
         const channelId = this.extractChannelId(msg);
         const rateKey = channelId ? `pts_err:${channelId}` : 'pts_err:unknown';
@@ -317,6 +317,9 @@ class Logger {
 
   public async setLevel(level: LogLevel) {
     await this.initDB();
+    if (!this.db) {
+      throw new Error("Logger DB is not initialized");
+    }
     this.level = level;
     this.db.data.level = level;
     await this.db.write();
@@ -367,6 +370,17 @@ class Logger {
     );
   }
 
+  private argsToMessage(args: unknown[]): string {
+    return args.map((arg) => {
+      if (typeof arg === "string") return arg;
+      if (arg instanceof Error) return `${arg.message} ${arg.stack || ""}`;
+      if (arg && typeof arg === "object" && "message" in arg) {
+        return String((arg as { message?: unknown }).message || "");
+      }
+      return "";
+    }).join(" ");
+  }
+
   /** Extract the first plausible channel ID from a teleproto error message. */
   private extractChannelId(msg: string): string | null {
     // Strip ANSI escape sequences so patterns like "[0m [Channel 123 ...]" are matched
@@ -380,7 +394,7 @@ class Logger {
     // "Channel 1680975844 difference too long" (after ANSI strip)
     m = clean.match(/Channel (\d+)/);
     if (m) return m[1];
-    // last-resort: any 8+ digit integer
+    // last-resort: first 8+ digit integer
     m = clean.match(/(\d{8,})/);
     return m ? m[1] : null;
   }

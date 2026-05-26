@@ -1,6 +1,7 @@
 import { Plugin } from "@utils/pluginBase";
 import { getGlobalClient } from "@utils/globalClient";
 import { Api, TelegramClient } from "teleproto";
+import type { EntityLike } from "teleproto/define";
 import { safeGetMessages, safeGetReplyMessage } from "@utils/safeGetMessages";
 import { getPrefixes } from "@utils/pluginManager";
 import { CustomFile } from "teleproto/client/uploads";
@@ -9,8 +10,62 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { safeGetMe } from "../utils/authGuards";
+import { htmlEscape } from "@utils/html";
+import { redactSecrets } from "@utils/security";
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
+
+type DebugEntity = {
+  className?: string;
+  id?: unknown;
+  firstName?: string;
+  lastName?: string;
+  username?: string;
+  title?: string;
+  bot?: boolean;
+  verified?: boolean;
+  premium?: boolean;
+  broadcast?: boolean;
+  participantsCount?: number;
+};
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function sendDebugDump(
+  msg: Api.Message,
+  trigger: Api.Message | undefined,
+  filename: string,
+  text: string
+): Promise<void> {
+  const escaped = `<blockquote expandable>${htmlEscape(text)}</blockquote>`;
+  if (escaped.length <= 3500) {
+    await msg.client?.sendMessage("me", {
+      message: escaped,
+      parseMode: "html",
+    });
+  } else {
+    const buffer = Buffer.from(text, "utf-8");
+    const dir = createDirectoryInTemp("debug");
+    const safeName = filename.replace(/[^a-zA-Z0-9_.-]/g, "_");
+    const filePath = path.join(dir, safeName);
+    fs.writeFileSync(filePath, buffer, { mode: 0o600 });
+    const size = fs.statSync(filePath).size;
+    await msg.client?.sendFile("me", {
+      file: new CustomFile(safeName, size, filePath),
+    });
+    fs.unlinkSync(filePath);
+  }
+  await (trigger || msg).edit({
+    text: "✅ 调试信息已脱敏并发送到 Saved Messages。",
+  }).catch(async () => {
+    await msg.client?.sendMessage(msg.peerId, {
+      message: "✅ 调试信息已脱敏并发送到 Saved Messages。",
+    });
+  });
+}
+
 class DebugPlugin extends Plugin {
 
   description: string = `<code>${mainPrefix}id 回复一条消息 或 留空查看当前对话 或 消息链接 或 用户名 或 群组ID</code> - 获取详细的用户、群组或频道信息
@@ -55,11 +110,11 @@ class DebugPlugin extends Plugin {
                 data: entity,
                 info: `解析用户名成功 - ${username}`,
               };
-            } catch (error: any) {
+            } catch (error: unknown) {
               parseResult = {
                 type: "entity",
                 data: null,
-                info: `解析用户名失败: ${error.message}`,
+                info: `解析用户名失败: ${errorMessage(error)}`,
               };
             }
           }
@@ -127,9 +182,9 @@ class DebugPlugin extends Plugin {
           text: targetInfo,
           parseMode: "html",
         });
-      } catch (error: any) {
+      } catch (error: unknown) {
         await msg.edit({
-          text: `获取信息时出错: ${error.message}`,
+          text: `获取信息时出错: ${errorMessage(error)}`,
         });
       }
     },
@@ -142,41 +197,10 @@ class DebugPlugin extends Plugin {
         input || reply?.senderId || msg.peerId
       );
 
-      const txt = JSON.stringify(entity, null, 2);
+      const txt = JSON.stringify(redactSecrets(entity), null, 2);
       console.log(txt);
 
-      // if ((entity as any)?.sender) {
-      //   console.log("sender", JSON.stringify((entity as any)?.sender, null, 2));
-      // }
-
-      try {
-        await msg.edit({
-          text: `<blockquote expandable>${txt}</blockquote>`,
-          parseMode: "html",
-        });
-      } catch (error: any) {
-        // 如果编辑失败且是因为消息过长，则发送文件
-        if (
-          error.message &&
-          (error.message.includes("MESSAGE_TOO_LONG") ||
-            error.message.includes("too long"))
-        ) {
-          const buffer = Buffer.from(txt, "utf-8");
-          const dir = createDirectoryInTemp("exit");
-
-          const filename = `entity_${entity?.id}.json`;
-          const filePath = path.join(dir, filename);
-          fs.writeFileSync(filePath, buffer);
-          const size = fs.statSync(filePath).size;
-          await (trigger || msg).reply({
-            file: new CustomFile(filename, size, filePath),
-          });
-          fs.unlinkSync(filePath);
-        } else {
-          // 其他错误则重新抛出
-          throw error;
-        }
-      }
+      await sendDebugDump(msg, trigger, `entity_${entity?.id || "unknown"}.json`, txt);
     },
     msg: async (msg, trigger) => {
       const reply = await safeGetReplyMessage(msg);
@@ -186,40 +210,13 @@ class DebugPlugin extends Plugin {
         });
         return;
       }
-      const txt = JSON.stringify(reply, null, 2);
+      const txt = JSON.stringify(redactSecrets(reply), null, 2);
       console.log(txt);
       // if (reply.media) {
       //   console.log("media", JSON.stringify(reply.media, null, 2));
       // }
 
-      try {
-        await msg.edit({
-          text: `<blockquote expandable>${txt}</blockquote>`,
-          parseMode: "html",
-        });
-      } catch (error: any) {
-        // 如果编辑失败且是因为消息过长，则发送文件
-        if (
-          error.message &&
-          (error.message.includes("MESSAGE_TOO_LONG") ||
-            error.message.includes("too long"))
-        ) {
-          const buffer = Buffer.from(txt, "utf-8");
-          const dir = createDirectoryInTemp("exit");
-
-          const filename = `msg_${reply.id}.json`;
-          const filePath = path.join(dir, filename);
-          fs.writeFileSync(filePath, buffer);
-          const size = fs.statSync(filePath).size;
-          await (trigger || msg).reply({
-            file: new CustomFile(filename, size, filePath),
-          });
-          fs.unlinkSync(filePath);
-        } else {
-          // 其他错误则重新抛出
-          throw error;
-        }
-      }
+      await sendDebugDump(msg, trigger, `msg_${reply.id}.json`, txt);
     },
 
 
@@ -231,7 +228,7 @@ class DebugPlugin extends Plugin {
         });
         return;
       }
-      const txt = JSON.stringify(reply, null, 2);
+      const txt = JSON.stringify(redactSecrets(reply), null, 2);
       console.log(txt);
 
       // gramjs 支持不全...
@@ -331,7 +328,7 @@ class DebugPlugin extends Plugin {
 // 解析结果接口
 interface ParseResult {
   type: "message" | "entity";
-  data: Api.Message | any;
+  data: Api.Message | unknown;
   info?: string;
 }
 
@@ -350,7 +347,7 @@ async function parseTelegramLink(
 
     if (messageMatch) {
       const [, chatIdentifier, messageId] = messageMatch;
-      let chatId: any;
+      let chatId: string;
 
       if (cleanLink.includes("/c/")) {
         // 私有群组/频道链接: https://t.me/c/1272003941/940776
@@ -407,63 +404,64 @@ async function parseTelegramLink(
     }
 
     return null;
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("解析链接失败:", error);
     return {
       type: "entity",
       data: null,
-      info: `解析失败: ${error.message}`,
+      info: `解析失败: ${errorMessage(error)}`,
     };
   }
 }
 
 // 格式化实体信息
-async function formatEntityInfo(entity: any): Promise<string> {
+async function formatEntityInfo(entity: unknown): Promise<string> {
   try {
+    const entityData = entity as DebugEntity;
     let info = "";
 
-    if (entity.className === "User") {
+    if (entityData.className === "User") {
       info += `<b>USER</b>\n`;
       info +=
-        `· Name: ${entity.firstName || ""} ${entity.lastName || ""}`.trim() +
+        `· Name: ${entityData.firstName || ""} ${entityData.lastName || ""}`.trim() +
         "\n";
       info += `· Username: ${
-        entity.username ? "@" + entity.username : "N/A"
+        entityData.username ? "@" + entityData.username : "N/A"
       }\n`;
-      info += `· ID: <code>${entity.id}</code>\n`;
-      if (entity.bot) info += `· Type: Bot\n`;
-      if (entity.verified) info += `· Verified\n`;
-      if (entity.premium) info += `· Premium\n`;
-    } else if (entity.className === "Channel") {
-      const isChannel = entity.broadcast;
+      info += `· ID: <code>${entityData.id}</code>\n`;
+      if (entityData.bot) info += `· Type: Bot\n`;
+      if (entityData.verified) info += `· Verified\n`;
+      if (entityData.premium) info += `· Premium\n`;
+    } else if (entityData.className === "Channel") {
+      const isChannel = entityData.broadcast;
       info += `<b>${isChannel ? "CHANNEL" : "SUPERGROUP"}</b>\n`;
-      info += `· Title: ${entity.title}\n`;
+      info += `· Title: ${entityData.title}\n`;
       info += `· Username: ${
-        entity.username ? "@" + entity.username : "N/A"
+        entityData.username ? "@" + entityData.username : "N/A"
       }\n`;
-      const entityId = entity.id.toString();
+      const entityId = String(entityData.id);
       const fullId = entityId.startsWith("-100") ? entityId : `-100${entityId}`;
       info += `· ID: <code>${fullId}</code>\n`;
-      if (entity.verified) info += `· Verified\n`;
-      if (entity.participantsCount)
-        info += `· Members: ${entity.participantsCount}\n`;
-    } else if (entity.className === "Chat") {
+      if (entityData.verified) info += `· Verified\n`;
+      if (entityData.participantsCount)
+        info += `· Members: ${entityData.participantsCount}\n`;
+    } else if (entityData.className === "Chat") {
       info += `<b>GROUP</b>\n`;
-      info += `· Title: ${entity.title}\n`;
-      const groupId = entity.id.toString();
+      info += `· Title: ${entityData.title}\n`;
+      const groupId = String(entityData.id);
       const fullGroupId = groupId.startsWith("-") ? groupId : `-${groupId}`;
       info += `· ID: <code>${fullGroupId}</code>\n`;
-      if (entity.participantsCount)
-        info += `· Members: ${entity.participantsCount}\n`;
+      if (entityData.participantsCount)
+        info += `· Members: ${entityData.participantsCount}\n`;
     } else {
       info += `<b>ENTITY</b>\n`;
-      info += `· Type: ${entity.className}\n`;
-      info += `· ID: <code>${entity.id}</code>\n`;
+      info += `· Type: ${entityData.className || "unknown"}\n`;
+      info += `· ID: <code>${entityData.id || "N/A"}</code>\n`;
     }
 
     return info;
-  } catch (error: any) {
-    return `❌ 格式化实体信息失败: ${error.message}`;
+  } catch (error: unknown) {
+    return `❌ 格式化实体信息失败: ${errorMessage(error)}`;
   }
 }
 
@@ -550,15 +548,15 @@ async function formatMessageInfo(msg: Api.Message): Promise<string> {
     }
 
     return info;
-  } catch (error: any) {
-    return `<b>MESSAGE</b>\nError: ${error.message}\n`;
+  } catch (error: unknown) {
+    return `<b>MESSAGE</b>\nError: ${errorMessage(error)}\n`;
   }
 }
 
 // 格式化用户信息
 async function formatUserInfo(
   client: TelegramClient,
-  userId: any,
+  userId: EntityLike,
   title: string = "USER",
   showCommonGroups: boolean = true
 ): Promise<string> {
@@ -587,8 +585,8 @@ async function formatUserInfo(
     }
 
     return info;
-  } catch (error: any) {
-    return `<b>${title}</b>\nError: ${error.message}\n`;
+  } catch (error: unknown) {
+    return `<b>${title}</b>\nError: ${errorMessage(error)}\n`;
   }
 }
 
@@ -598,8 +596,8 @@ async function formatSelfInfo(client: TelegramClient): Promise<string> {
     const me = await safeGetMe(client);
     if (!me) return "";
     return await formatUserInfo(client, me.id, "SELF", false);
-  } catch (error: any) {
-    return `<b>SELF</b>\nError: ${error.message}\n`;
+  } catch (error: unknown) {
+    return `<b>SELF</b>\nError: ${errorMessage(error)}\n`;
   }
 }
 
@@ -646,8 +644,8 @@ async function formatChatInfo(
     }
 
     return info;
-  } catch (error: any) {
-    return `<b>CHAT</b>\nError: ${error.message}\n`;
+  } catch (error: unknown) {
+    return `<b>CHAT</b>\nError: ${errorMessage(error)}\n`;
   }
 }
 
@@ -658,15 +656,15 @@ async function parseGroupId(client: TelegramClient, chatId: string): Promise<str
     info += `· 输入ID: <code>${chatId}</code>\n`;
 
     // 尝试获取群组信息
-    let entity: any;
+    let entity: DebugEntity | null = null;
     let entityFound = false;
     
     try {
-      entity = await client.getEntity(chatId);
+      entity = (await client.getEntity(chatId)) as DebugEntity;
       entityFound = true;
-    } catch (error: any) {
+    } catch (error: unknown) {
       info += `· 状态: ❌ 无法访问此群组\n`;
-      info += `· 错误: ${error.message}\n\n`;
+      info += `· 错误: ${errorMessage(error)}\n\n`;
     }
 
     if (entityFound && entity) {
@@ -746,8 +744,8 @@ async function parseGroupId(client: TelegramClient, chatId: string): Promise<str
 
     return info;
     
-  } catch (error: any) {
-    return `❌ 解析群组ID时发生错误: ${error.message}`;
+  } catch (error: unknown) {
+    return `❌ 解析群组ID时发生错误: ${errorMessage(error)}`;
   }
 }
 

@@ -1,4 +1,4 @@
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
 
@@ -18,7 +18,7 @@ function readDisplayVersion(): string {
   const version = readVersion();
 
   try {
-    const commit = execSync("git rev-parse --short HEAD", {
+    const commit = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
       cwd: process.cwd(),
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],

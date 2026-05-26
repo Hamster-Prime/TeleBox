@@ -3,6 +3,7 @@ import { Plugin, type PluginRuntimeContext } from "@utils/pluginBase";
 import { Api } from "teleproto";
 import type { GenerationContext } from "@utils/generationContext";
 import { tryGetCurrentGenerationContext } from "@utils/runtimeManager";
+import { htmlEscape } from "@utils/html";
 
 
 function truncate(text: string, max = 3500) {
@@ -70,9 +71,9 @@ async function handleExec(params: { msg: Api.Message; shellCommand: string; life
   await msg.edit({
     text:
       `✅ 已开始执行 shell 命令…\n` +
-      `命令：\`${shellCommand}\`\n` +
+      `命令：<code>${htmlEscape(shellCommand)}</code>\n` +
       `状态：运行中 0s`,
-    parseMode: "markdown",
+    parseMode: "html",
   });
 
   let stopped = false;
@@ -83,9 +84,9 @@ async function handleExec(params: { msg: Api.Message; shellCommand: string; life
     void msg.edit({
       text:
         `✅ 已开始执行 shell 命令…\n` +
-        `命令：\`${shellCommand}\`\n` +
+        `命令：<code>${htmlEscape(shellCommand)}</code>\n` +
         `状态：运行中 ${cost}s`,
-      parseMode: "markdown",
+      parseMode: "html",
     }).catch(() => undefined);
   }, 2000, { label: "exec:status-interval" });
 
@@ -96,18 +97,20 @@ async function handleExec(params: { msg: Api.Message; shellCommand: string; life
 
     const costMs = Date.now() - start;
 
+    const stdoutText = truncate(stdout || "(无输出)", stderr ? 2500 : 3200);
+    const stderrText = stderr ? truncate(stderr, 900) : "";
     let text =
       `✅ 执行完成（${(costMs / 1000).toFixed(2)}s）\n` +
-      `命令：\`${shellCommand}\`\n\n` +
-      `shell 输出：\n${stdout || "(无输出)"}`;
+      `命令：<code>${htmlEscape(shellCommand)}</code>\n\n` +
+      `shell 输出：\n<pre>${htmlEscape(stdoutText)}</pre>`;
 
     if (stderr) {
-      text += `\n\nshell 错误：\n${stderr}`;
+      text += `\n\nshell 错误：\n<pre>${htmlEscape(stderrText)}</pre>`;
     }
 
     await msg.edit({
-      text: truncate(text),
-      parseMode: "markdown",
+      text,
+      parseMode: "html",
     });
   } catch (error) {
     stopped = true;
@@ -116,12 +119,11 @@ async function handleExec(params: { msg: Api.Message; shellCommand: string; life
     const costMs = Date.now() - start;
 
     await msg.edit({
-      text: truncate(
+      text:
         `❌ 执行失败（${(costMs / 1000).toFixed(2)}s）\n` +
-          `命令：\`${shellCommand}\`\n\n` +
-          `错误：${String(error)}`
-      ),
-      parseMode: "markdown",
+        `命令：<code>${htmlEscape(shellCommand)}</code>\n\n` +
+        `错误：${htmlEscape(truncate(String(error), 3000))}`,
+      parseMode: "html",
     });
   }
 }
@@ -157,6 +159,13 @@ class ExecPlugin extends Plugin {
   }
 
   description: string = `运行 shell 命令`;
+  commandPolicies = {
+    exec: {
+      risk: "dangerous" as const,
+      delegation: "owner-only" as const,
+      reason: ".exec runs arbitrary shell commands and is restricted to the account owner.",
+    },
+  };
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     exec: async (msg) => {
       const lifecycle = this.resolveLifecycle();

@@ -11,6 +11,7 @@ import {
   EditedMessageEvent,
 } from "teleproto/events/EditedMessage";
 import type { TeleBoxRuntime } from "./runtimeManager";
+import { assertCommandAllowedForInvocation } from "./commandPolicy";
 
 type ClientEventBuilder = NonNullable<Parameters<TeleBoxRuntime["client"]["removeEventHandler"]>[1]>;
 
@@ -29,10 +30,13 @@ type PluginEntry = {
   aliasFinal?: string;
   plugin: Plugin;
 };
+type AliasRecord = { original: string; final: string };
 
 const validPlugins: Plugin[] = [];
 const plugins: Map<string, PluginEntry> = new Map();
 const loadedPluginFiles: Set<string> = new Set();
+const loadedPluginNames: Set<string> = new Set();
+let aliasCache: AliasRecord[] = [];
 let pluginLoadDepth = 0;
 
 const USER_PLUGIN_PATH = path.join(process.cwd(), "plugins");
@@ -164,10 +168,6 @@ async function setPlugins(basePath: string) {
     .readdirSync(basePath)
     .filter((file) => file.endsWith(".ts"));
 
-  const aliasDB = new AliasDB();
-  const aliasList = aliasDB.list();
-  aliasDB.close();
-
   for await (const file of files) {
     const pluginPath = path.resolve(basePath, file);
     const mod = dynamicRequireWithDeps(pluginPath);
@@ -178,14 +178,25 @@ async function setPlugins(basePath: string) {
       if (!plugin.name) {
         plugin.name = path.basename(file, ".ts");
       }
+      if (loadedPluginNames.has(plugin.name)) {
+        console.warn(
+          `[PLUGIN] Skip duplicate plugin "${plugin.name}" from ${pluginPath}. First loaded plugin wins.`
+        );
+        continue;
+      }
+      loadedPluginNames.add(plugin.name);
 
       validPlugins.push(plugin);
       const cmds = Object.keys(plugin.cmdHandlers);
 
       for (const cmd of cmds) {
+        if (plugins.has(cmd)) {
+          console.warn(`[PLUGIN] Skip duplicate command "${cmd}" from plugin "${plugin.name}".`);
+          continue;
+        }
         plugins.set(cmd, { plugin });
 
-        const relatedAliases = aliasList.filter(
+        const relatedAliases = aliasCache.filter(
           (rec) => rec.final === cmd || rec.final.startsWith(cmd + " ")
         );
 
@@ -232,16 +243,14 @@ function getCommandFromMessage(
   const parts = rest.split(/\s+/).filter(Boolean);
   if (parts.length === 0) return null;
 
-  const aliasDB = new AliasDB();
   let aliasCandidate: string | null = null;
   for (let i = parts.length; i >= 1; i--) {
     const candidate = parts.slice(0, i).join(" ");
-    if (aliasDB.get(candidate)) {
+    if (aliasCache.some((rec) => rec.original === candidate)) {
       aliasCandidate = candidate;
       break;
     }
   }
-  aliasDB.close();
 
   if (aliasCandidate) {
     return aliasCandidate;
@@ -312,6 +321,13 @@ async function dealCommandPluginWithMessage(param: {
 
     const handler = pluginEntry.plugin.cmdHandlers[targetCmd];
     if (handler) {
+      const base = targetMsg as MessageWithText;
+      assertCommandAllowedForInvocation({
+        cmd: targetCmd,
+        messageText: base.message || base.text || "",
+        plugin: pluginEntry.plugin,
+        trigger,
+      });
       await handler(targetMsg, trigger);
     }
   } catch (error) {
@@ -508,12 +524,24 @@ async function unloadPluginsForRuntime(runtime: TeleBoxRuntime) {
   validPlugins.length = 0;
   plugins.clear();
   loadedPluginFiles.clear();
+  loadedPluginNames.clear();
+  aliasCache = [];
   purgeModuleCache(oldPluginFiles);
+}
+
+function refreshAliasCache(): void {
+  const aliasDB = new AliasDB();
+  try {
+    aliasCache = aliasDB.list();
+  } finally {
+    aliasDB.close();
+  }
 }
 
 async function loadPluginsForRuntime(runtime: TeleBoxRuntime) {
   pluginLoadDepth++;
   try {
+    refreshAliasCache();
     await setPlugins(USER_PLUGIN_PATH);
     await setPlugins(DEFAUTL_PLUGIN_PATH);
   } finally {

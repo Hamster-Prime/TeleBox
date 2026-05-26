@@ -2,7 +2,7 @@ import { Plugin } from "@utils/pluginBase";
 import { getPrefixes } from "@utils/pluginManager";
 import { Api } from "teleproto";
 import { safeGetReplyMessage } from "@utils/safeGetMessages";
-import { SureDB } from "@utils/sureDB";
+import { SureDB, type MsgRecord } from "@utils/sureDB";
 import { sleep } from "teleproto/Helpers";
 import {
   dealCommandPluginWithMessage,
@@ -26,7 +26,7 @@ function htmlEscape(text: string): string {
 let sureCache = {
   ids: [] as number[],
   cids: [] as number[],
-  msgs: [] as any[],
+  msgs: [] as MsgRecord[],
   ts: 0,
 };
 const SURE_CACHE_TTL = 10_000; // 10s
@@ -58,8 +58,22 @@ function getSureMsgs() {
   return sureCache.msgs;
 }
 
-function extractId(from: any): number | null {
-  const raw = from?.chatId || from?.channelId || from?.userId;
+type PeerLike = { chatId?: unknown; channelId?: unknown; userId?: unknown };
+type DisplayEntity = {
+  title?: unknown;
+  firstName?: unknown;
+  lastName?: unknown;
+  username?: unknown;
+  id?: unknown;
+};
+
+function asPeerLike(from: unknown): PeerLike {
+  return typeof from === "object" && from !== null ? (from as PeerLike) : {};
+}
+
+function extractId(from: unknown): number | null {
+  const peer = asPeerLike(from);
+  const raw = peer.chatId || peer.channelId || peer.userId;
   if (!raw) return null;
   const n = Number(raw);
   return Number.isFinite(n) ? n : null;
@@ -67,15 +81,15 @@ function extractId(from: any): number | null {
 
 function buildDisplay(
   id: number,
-  entity: any,
+  entity: DisplayEntity | undefined,
   isUser: boolean,
   mention?: boolean,
 ) {
   const parts: string[] = [];
-  if (entity?.title) parts.push(entity.title);
-  if (entity?.firstName) parts.push(entity.firstName);
-  if (entity?.lastName) parts.push(entity.lastName);
-  if (entity?.username)
+  if (typeof entity?.title === "string") parts.push(entity.title);
+  if (typeof entity?.firstName === "string") parts.push(entity.firstName);
+  if (typeof entity?.lastName === "string") parts.push(entity.lastName);
+  if (typeof entity?.username === "string")
     parts.push(
       mention ? `@${entity.username}` : `<code>@${entity.username}</code>`,
     );
@@ -92,13 +106,13 @@ async function handleAddDel(
   target: string,
   action: "add" | "del",
 ) {
-  let entity: any;
-  let uid: any;
-  let display: any;
+  let entity: DisplayEntity | undefined;
+  let uid: number;
+  let display: string;
   if (target) {
     try {
       entity = await msg.client?.getEntity(target);
-      uid = entity?.id;
+      uid = Number(entity?.id);
       if (!uid) {
         await msg.edit({ text: "无法获取用户 ID" });
         return;
@@ -119,17 +133,18 @@ async function handleAddDel(
       await msg.edit({ text: "无法获取回复消息" });
       return;
     }
-    uid = extractId(reply.fromId as any);
-    if (!uid) {
+    const replyUid = extractId(reply.fromId);
+    if (!replyUid) {
       await msg.edit({ text: "无法获取用户 ID" });
       return;
     }
+    uid = replyUid;
     try {
       entity = await msg.client?.getEntity(uid);
     } catch {
       /* ignore */
     }
-    display = buildDisplay(uid, entity, !!(reply.fromId as any)?.userId);
+    display = buildDisplay(uid, entity, Boolean(asPeerLike(reply.fromId).userId));
   }
 
   withSureDB((db) => {
@@ -158,16 +173,16 @@ async function handleList(msg: Api.Message) {
 }
 async function handleChatAddDel(
   msg: Api.Message,
-  target: any,
+  target: string | undefined,
   action: "add" | "del",
 ) {
-  let entity: any;
-  let cid: any;
-  let display: any;
+  let entity: DisplayEntity | undefined;
+  let cid: number;
+  let display: string;
   if (target) {
     try {
       entity = await msg.client?.getEntity(target);
-      cid = entity?.id;
+      cid = Number(entity?.id);
       if (!cid) {
         await msg.edit({ text: "无法获取对话 ID" });
         return;
@@ -179,17 +194,18 @@ async function handleChatAddDel(
       return;
     }
   } else {
-    cid = extractId(msg.peerId as any);
-    if (!cid) {
+    const peerCid = extractId(msg.peerId);
+    if (!peerCid) {
       await msg.edit({ text: "无法获取对话 ID" });
       return;
     }
+    cid = peerCid;
     try {
       entity = await msg.client?.getEntity(cid);
     } catch {
       /* ignore */
     }
-    display = buildDisplay(cid, entity, !!(msg.peerId as any)?.userId);
+    display = buildDisplay(cid, entity, Boolean(asPeerLike(msg.peerId).userId));
   }
 
   withSureDB((db) => {
@@ -217,7 +233,7 @@ async function handleChatList(msg: Api.Message) {
 }
 async function handleMsgAddDel(
   msg: Api.Message,
-  input: any,
+  input: string,
   action: "add" | "del",
   id?: string,
 ) {
@@ -232,7 +248,7 @@ async function handleMsgAddDel(
         db.addMsg(input);
       }
     } else {
-      db.delMsg(input);
+      db.delMsg(Number(input));
     }
   });
   sureCache.ts = 0; // 失效缓存
@@ -349,8 +365,8 @@ class surePlugin extends Plugin {
   listenMessageHandler?: ((msg: Api.Message) => Promise<void>) | undefined =
     async (msg) => {
       if (msg.fwdFrom) return;
-      const uid = extractId(msg.fromId as any);
-      const cid = extractId(msg.peerId as any);
+      const uid = extractId(msg.fromId);
+      const cid = extractId(msg.peerId);
       if (!uid || !cid) return;
       if (!getSureIds().includes(uid)) return;
       const cids = getSureCids();
@@ -380,7 +396,7 @@ class surePlugin extends Plugin {
         replyTo:
           (msg.replyTo?.forumTopic ? msg.replyTo?.replyToTopId : undefined) ||
           msg.replyToMsgId,
-        formattingEntities: message.entities,
+        formattingEntities: replacedMsg ? undefined : msg.entities,
       });
       if (cmd && sudoMsg)
         await dealCommandPluginWithMessage({

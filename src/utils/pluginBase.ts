@@ -1,6 +1,7 @@
 import { Api, TelegramClient } from "teleproto";
 import type { EventBuilder } from "teleproto/events/common";
 import type { GenerationContext } from "./generationContext";
+import type { CommandPolicy } from "./commandPolicy";
 
 export interface PluginRuntimeContext {
   generation: number;
@@ -39,6 +40,7 @@ abstract class Plugin {
     string,
     (msg: Api.Message, trigger?: Api.Message) => Promise<void>
   >;
+  commandPolicies?: Record<string, CommandPolicy>;
   listenMessageHandlerIgnoreEdited?: boolean = true;
   listenMessageHandler?: (
     msg: Api.Message,
@@ -67,6 +69,13 @@ function isValidPlugin(obj: unknown): obj is Plugin {
     if (typeof candidate.cmdHandlers[key] !== "function") {
       return false;
     }
+  }
+
+  if (
+    candidate.commandPolicies &&
+    typeof candidate.commandPolicies !== "object"
+  ) {
+    return false;
   }
 
   if (

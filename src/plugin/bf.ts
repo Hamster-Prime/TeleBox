@@ -87,9 +87,13 @@ interface FileInfo {
   date: string;
 }
 
+const MAX_BACKUP_BYTES = 200 * 1024 * 1024;
+const SECRET_BACKUP_NAMES = new Set(["config.json", ".env"]);
+
 // 配置管理类
 class ConfigManager {
   private static db: Low<BackupConfig> | null = null;
+  private static writeQueue: Promise<void> = Promise.resolve();
 
   static async getDB(): Promise<Low<BackupConfig>> {
     if (!this.db) {
@@ -110,7 +114,7 @@ class ConfigManager {
   static async setTargets(targets: string[]): Promise<void> {
     const db = await this.getDB();
     db.data.target_chat_ids = targets;
-    await db.write();
+    await this.write(db);
   }
 
   static async addTargets(newTargets: string[]): Promise<string[]> {
@@ -133,6 +137,13 @@ class ConfigManager {
 
   static cleanup(): void {
     this.db = null;
+    this.writeQueue = Promise.resolve();
+  }
+
+  private static async write(db: Low<BackupConfig>): Promise<void> {
+    const write = this.writeQueue.then(() => db.write());
+    this.writeQueue = write.catch(() => undefined);
+    await write;
   }
 }
 
@@ -234,6 +245,9 @@ function copyDirRecursive(src: string, dest: string): void {
   const entries = fs.readdirSync(src, { withFileTypes: true });
 
   for (const entry of entries) {
+    if (SECRET_BACKUP_NAMES.has(entry.name) || entry.name.startsWith(".env.")) {
+      continue;
+    }
     const srcPath = path.join(src, entry.name);
     const destPath = path.join(dest, entry.name);
 
@@ -314,7 +328,7 @@ async function restoreBackup(extractPath: string): Promise<void> {
 }
 
 const help_text = `<code>${mainPrefix}bf</code> 备份 plugins + assets 目录
-<code>${mainPrefix}bf all</code> - 备份整个程序（包含所有文件）
+<code>${mainPrefix}bf all</code> - 已禁用（避免泄漏 config/.env/宿主机文件）
 <code>${mainPrefix}bf set 对话ID</code> - 设置备份发送到的目标对话
 <code>${mainPrefix}bf to 对话ID</code> - 仅本次备份发送到目标对话
 <code>${mainPrefix}bf del 对话ID/all</code> - 删除备份发送到的目标对话
@@ -472,55 +486,13 @@ class BfPlugin extends Plugin {
         const backupPath = path.join(os.tmpdir(), backupName);
 
         if (cmd === "all") {
-          const parentDir = path.dirname(programDir);
-          const dirName = path.basename(programDir);
-          
-          await lifecycle.runTask(
-            async () =>
-              await new Promise<void>((resolve, reject) => {
-                  const tar = trackChildProcess(spawn("tar", [
-                    "-cf",
-                    "-",
-                    "-C",
-                    parentDir,
-                    "--exclude=node_modules",
-                    "--exclude=.git",
-                    "--exclude=my_session",
-                    "--exclude=temp",
-                    "--exclude=logs",
-                    dirName,
-                  ], { stdio: ["pipe", "pipe", "pipe"] }), lifecycle, "bf:full-tar");
-
-                  const gzip = trackChildProcess(
-                    spawn("gzip", ["-1"], { stdio: ["pipe", "pipe", "pipe"] }),
-                    lifecycle,
-                    "bf:full-gzip"
-                  );
-
-                  const output = fs.createWriteStream(backupPath);
-
-                  tar.stdout.pipe(gzip.stdin);
-                  gzip.stdout.pipe(output);
-
-                  let tarError = "";
-                  let gzipError = "";
-                  tar.stderr.on("data", (d) => (tarError += d.toString()));
-                  gzip.stderr.on("data", (d) => (gzipError += d.toString()));
-
-                  output.on("finish", () => resolve());
-                  output.on("error", reject);
-                  tar.on("error", reject);
-                  gzip.on("error", reject);
-                  tar.on("close", (code) => {
-                    if (code !== 0) reject(new Error(`tar: ${tarError || code}`));
-                  });
-                  gzip.on("close", (code) => {
-                    if (code !== 0) reject(new Error(`gzip: ${gzipError || code}`));
-                  });
-                  throwIfAborted(lifecycle);
-              }),
-            { label: "bf:full-backup-pipeline" }
-          );
+          await msg.edit({
+            text:
+              "❌ <b>全量备份已禁用</b>\n\n" +
+              "为避免泄漏 config.json、.env、日志和宿主机文件，请使用标准备份（plugins + assets）。",
+            parseMode: "html",
+          });
+          return;
         } else {
           const dirsToBackup = [
             path.join(programDir, "plugins"),
@@ -541,6 +513,9 @@ class BfPlugin extends Plugin {
         await msg.edit({ text: "📤 正在上传备份...", parseMode: "html" });
 
         const stats = fs.statSync(backupPath);
+        if (stats.size > MAX_BACKUP_BYTES) {
+          throw new Error(`备份文件过大 (${(stats.size / 1024 / 1024).toFixed(2)} MB)，超过上限 ${(MAX_BACKUP_BYTES / 1024 / 1024).toFixed(0)} MB`);
+        }
         const backupType = cmd === "all" ? "全量备份" : "标准备份";
         const contentDesc = cmd === "all" 
           ? "程序目录（排除node_modules等）"
@@ -713,6 +688,17 @@ class BfPlugin extends Plugin {
           parseMode: "html",
         });
       }
+    },
+  };
+  commandPolicies = {
+    bf: {
+      blockedSubcommands: ["all"],
+      reason: ".bf all can include sensitive program files and is restricted to the account owner.",
+    },
+    hf: {
+      risk: "dangerous" as const,
+      delegation: "owner-only" as const,
+      reason: ".hf restores files from an archive and is restricted to the account owner.",
     },
   };
 }

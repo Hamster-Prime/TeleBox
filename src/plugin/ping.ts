@@ -2,18 +2,19 @@ import { Plugin } from "@utils/pluginBase";
 import { getPrefixes } from "@utils/pluginManager";
 import { getGlobalClient } from "@utils/globalClient";
 import { Api } from "teleproto";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import { createConnection } from "net";
 import { PromisedNetSockets } from "teleproto/extensions";
 import * as dns from "dns";
+import * as net from "net";
 
 import { safeGetMe } from "../utils/authGuards";
 const prefixes = getPrefixes();
 const mainPrefix = prefixes[0];
 
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // 数据中心IP地址映射 (参考PagerMaid-Modify)
 const DCs = {
@@ -165,17 +166,30 @@ async function systemPing(
   count: number = 3
 ): Promise<{ avg: number; loss: number; output: string }> {
   try {
-    const pingCmd = `ping -c ${count} -W 5 ${target}`;
-    const { stdout, stderr } = await execAsync(pingCmd, { timeout: 10000 });
+    const safeCount = Math.min(Math.max(Math.trunc(count), 1), 5);
+    const args =
+      process.platform === "win32"
+        ? ["-n", String(safeCount), "-w", "5000", target]
+        : process.platform === "darwin"
+        ? ["-c", String(safeCount), "-W", "5000", target]
+        : ["-c", String(safeCount), "-W", "5", target];
+    const { stdout } = await execFileAsync("ping", args, {
+      timeout: 10000,
+      windowsHide: true,
+      maxBuffer: 64 * 1024,
+    });
 
     console.log(stdout);
 
-    // 解析Linux ping结果
     let avgTime = -1;
     let packetLoss = 100;
 
-    const avgMatch = stdout.match(/avg\/[^=]+=\s*?([0-9.]+)/);
-    const lossMatch = stdout.match(/(\d+)% packet loss/);
+    const avgMatch =
+      stdout.match(/(?:rtt|round-trip)[^=]+=\s*[0-9.]+\/([0-9.]+)\//i) ||
+      stdout.match(/Average\s*=\s*([0-9]+)ms/i);
+    const lossMatch =
+      stdout.match(/(\d+(?:\.\d+)?)%\s*packet loss/i) ||
+      stdout.match(/\((\d+(?:\.\d+)?)%\s*loss\)/i);
 
     if (avgMatch) {
       avgTime = Math.round(parseFloat(avgMatch[1]));
@@ -209,17 +223,8 @@ async function pingDataCenters(): Promise<string[]> {
   for (let dc = 1; dc <= 5; dc++) {
     const ip = DCs[dc as keyof typeof DCs];
     try {
-      // Linux: 使用awk提取时间
-      const { stdout } = await execAsync(
-        `ping -c 1 ${ip} | awk -F 'time=' '/time=/ {print $2}' | awk '{print $1}'`
-      );
-
-      let pingTime = "0";
-      try {
-        pingTime = String(Math.round(parseFloat(stdout.trim())));
-      } catch {
-        pingTime = "0";
-      }
+      const { avg } = await systemPing(ip, 1);
+      const pingTime = avg >= 0 ? String(avg) : "0";
 
       const dcLocation =
         dc === 1 || dc === 3
@@ -252,21 +257,37 @@ function parseTarget(input: string): {
   type: "ip" | "domain" | "dc";
   value: string;
 } {
+  const normalizedInput = input.trim().toLowerCase();
   // 检查是否为数据中心
-  if (/^dc[1-5]$/i.test(input)) {
-    const dcNum = parseInt(input.slice(2)) as keyof typeof DCs;
+  if (/^dc[1-5]$/i.test(normalizedInput)) {
+    const dcNum = parseInt(normalizedInput.slice(2)) as keyof typeof DCs;
     return { type: "dc", value: DCs[dcNum] };
   }
 
   // 检查是否为IP地址
-  const ipRegex =
-    /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-  if (ipRegex.test(input)) {
-    return { type: "ip", value: input };
+  if (net.isIP(normalizedInput)) {
+    return { type: "ip", value: normalizedInput };
+  }
+
+  if (!isValidHostname(normalizedInput)) {
+    throw new Error("无效目标。仅支持 IP 地址、dc1-dc5 或标准域名。");
   }
 
   // 默认为域名
-  return { type: "domain", value: input };
+  return { type: "domain", value: normalizedInput };
+}
+
+function isValidHostname(input: string): boolean {
+  if (input.length === 0 || input.length > 253) return false;
+  if (input.includes("..")) return false;
+  if (/[^a-z0-9.-]/i.test(input)) return false;
+  return input.split(".").every((label) => {
+    return (
+      label.length > 0 &&
+      label.length <= 63 &&
+      /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label)
+    );
+  });
 }
 
 class PingPlugin extends Plugin {

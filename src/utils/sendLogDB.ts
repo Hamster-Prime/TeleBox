@@ -1,6 +1,7 @@
-import Database from "better-sqlite3";
+import type Database from "better-sqlite3";
 import path from "path";
 import { createDirectoryInAssets } from "./pathHelpers";
+import { openSharedDatabase } from "./sqlite";
 
 class SendLogDB {
   private db: Database.Database;
@@ -8,7 +9,7 @@ class SendLogDB {
   constructor(
     dbPath: string = path.join(createDirectoryInAssets("sendlog"), "sendlog.db")
   ) {
-    this.db = new Database(dbPath);
+    this.db = openSharedDatabase(dbPath);
     this.init();
   }
 
@@ -40,7 +41,7 @@ class SendLogDB {
   }
 
   public close(): void {
-    this.db.close();
+    // Shared per-process handle; closed on process exit.
   }
 }
 

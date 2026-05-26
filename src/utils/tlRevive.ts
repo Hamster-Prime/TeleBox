@@ -3,48 +3,55 @@
 
 import { Api } from "teleproto";
 
-type JsonLike = any;
+type JsonLike = unknown;
+type JsonRecord = Record<string, unknown>;
+type TlConstructor = new (args: JsonRecord) => unknown;
 
-function isBufferLike(v: any): v is { type: "Buffer"; data: number[] } {
+function isRecord(v: unknown): v is JsonRecord {
+  return typeof v === "object" && v !== null;
+}
+
+function isBufferLike(v: unknown): v is { type: "Buffer"; data: number[] } {
   return (
-    v && typeof v === "object" && v.type === "Buffer" && Array.isArray(v.data)
+    isRecord(v) && v.type === "Buffer" && Array.isArray(v.data)
   );
 }
 
-function resolveCtor(className: string): any | undefined {
+function resolveCtor(className: string): TlConstructor | undefined {
   // Supports names like "MessageEntityBold" or namespaced "messages.SendMessage"
   const parts = className.split(".");
-  let cur: any = Api as any;
+  let cur: unknown = Api;
   for (const p of parts) {
-    cur = cur?.[p];
+    cur = isRecord(cur) ? cur[p] : undefined;
     if (!cur) return undefined;
   }
-  return cur;
+  return typeof cur === "function" ? (cur as TlConstructor) : undefined;
 }
 
-export function reviveTl<T = any>(input: JsonLike): T {
+export function reviveTl<T = unknown>(input: JsonLike): T {
   // Arrays
   if (Array.isArray(input)) {
-    // @ts-ignore
-    return input.map((i) => reviveTl(i));
+    return input.map((i) => reviveTl(i)) as T;
   }
   // Buffers serialized by JSON
   if (isBufferLike(input)) {
-    // @ts-ignore
-    return Buffer.from(input.data);
+    return Buffer.from(input.data) as T;
   }
   // Primitive
-  if (!input || typeof input !== "object") {
-    // @ts-ignore
-    return input;
+  if (!isRecord(input)) {
+    return input as T;
   }
 
   // If it looks like a TL JSON object with className/_ markers
   const className: string | undefined =
-    (input as any).className || (input as any)._;
+    typeof input.className === "string"
+      ? input.className
+      : typeof input._ === "string"
+      ? input._
+      : undefined;
 
   // Recurse into properties first to revive nested children
-  const revivedArgs: Record<string, any> = {};
+  const revivedArgs: JsonRecord = {};
   for (const [k, v] of Object.entries(input)) {
     if (k === "className" || k === "_") continue;
     revivedArgs[k] = reviveTl(v);
@@ -53,13 +60,11 @@ export function reviveTl<T = any>(input: JsonLike): T {
   if (className) {
     const Ctor = resolveCtor(className);
     if (typeof Ctor === "function") {
-      // @ts-ignore
-      return new Ctor(revivedArgs);
+      return new Ctor(revivedArgs) as T;
     }
     // If we cannot resolve, fall through and return plain object
   }
 
-  // @ts-ignore
   return revivedArgs as T;
 }
 

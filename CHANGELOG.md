@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### 安全与运维
+
+- 恢复 `package-lock.json`，新增 `typecheck`、`typecheck:plugins`、`test`、`audit` 脚本。
+- 收紧 TPM 远程插件安装路径、URL allowlist、响应大小限制与 `--yes` 确认提示。
+- sudo/sure 委托默认禁止危险命令：`.exec`、危险 `.tpm`、`.update`、`.sendlog`、`.prefix`、`.bf all`。
+- `config.json` 写入权限收紧到 `0600`，支持 `TB_API_ID`、`TB_API_HASH`、`TB_SESSION` 环境变量注入。
+- 日志/debug 输出脱敏，`sendlog` 改为发送脱敏后的最近日志片段。
+
 ## [0.2.7-docs] --2026-03-20
 
 ### 文档

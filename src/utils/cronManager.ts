@@ -7,6 +7,7 @@ interface CronTask {
   cron: string;
   description?: string;
   job: CronJob | null;
+  executions: Set<Promise<void>>;
   running: number;
   executionsStarted: number;
   executionsFinished: number;
@@ -35,6 +36,7 @@ class CronManager {
     const taskState: CronTask = {
       cron,
       job: null,
+      executions: new Set(),
       running: 0,
       executionsStarted: 0,
       executionsFinished: 0,
@@ -45,9 +47,11 @@ class CronManager {
       taskState.running += 1;
       taskState.executionsStarted += 1;
       const task = Promise.resolve(handler()).finally(() => {
+        taskState.executions.delete(task);
         taskState.running = Math.max(0, taskState.running - 1);
         taskState.executionsFinished += 1;
       });
+      taskState.executions.add(task);
       if (context) {
         context.trackTask(task, { label: `cron:${name}:execution`, kind: "cron-execution" });
         task.catch(console.error);
@@ -59,8 +63,8 @@ class CronManager {
     taskState.job = job;
     job.start();
     this.tasks.set(name, taskState);
-    const stopCronTask = (): void => {
-      this.del(name);
+    const stopCronTask = async (): Promise<void> => {
+      await this.del(name);
     };
     const dispose = context?.trackDisposable(stopCronTask, {
       label: `cron:${name}:job`,
@@ -69,13 +73,16 @@ class CronManager {
     return dispose;
   }
 
-  del(name: string): boolean {
+  async del(name: string): Promise<boolean> {
     const task = this.tasks.get(name);
     if (!task) return false;
     if (task.job) {
       task.job.stop();
     }
     this.tasks.delete(name);
+    if (task.executions.size > 0) {
+      await Promise.allSettled([...task.executions]);
+    }
     return true;
   }
 
@@ -86,13 +93,9 @@ class CronManager {
     return Array.from(this.tasks.keys());
   }
 
-  clear(): void {
-    for (const task of this.tasks.values()) {
-      if (task.job) {
-        task.job.stop();
-      }
-    }
-    this.tasks.clear();
+  async clear(): Promise<void> {
+    const names = [...this.tasks.keys()];
+    await Promise.all(names.map((name) => this.del(name)));
   }
 
   has(name: string): boolean {

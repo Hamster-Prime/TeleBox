@@ -17,9 +17,20 @@ const help_text = `🛠 <b>前缀管理</b>
 • <code>${htmlEscape(mainPrefix)}prefix add [前缀...]</code> - 追加前缀
 • <code>${htmlEscape(mainPrefix)}prefix del [前缀...]</code> - 删除前缀`;
 
+function isValidPrefix(prefix: string): boolean {
+  return prefix.length > 0 && prefix.length <= 16 && !/[\s"'`\r\n]/.test(prefix);
+}
+
 class PrefixPlugin extends Plugin {
 
   description: string = help_text;
+  commandPolicies = {
+    prefix: {
+      risk: "dangerous" as const,
+      delegation: "owner-only" as const,
+      reason: ".prefix changes global command routing and is restricted to the account owner.",
+    },
+  };
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     prefix: async (msg) => {
       const lines = msg.text?.trim()?.split(/\r?\n/g) || [];
@@ -78,6 +89,14 @@ class PrefixPlugin extends Plugin {
         return;
       }
       const uniq = Array.from(new Set(list));
+      const invalid = uniq.filter((prefix) => !isValidPrefix(prefix));
+      if (invalid.length > 0) {
+        await msg.edit({
+          text: `❌ 前缀包含无效字符: ${invalid.map((p) => `<code>${htmlEscape(p)}</code>`).join(" ")}`,
+          parseMode: "html",
+        });
+        return;
+      }
       // 直接设置前缀以避免缓存问题
       const pluginManager = require("@utils/pluginManager");
       if (pluginManager.setPrefixes) {
@@ -92,7 +111,7 @@ class PrefixPlugin extends Plugin {
       try {
         const envPath = path.join(process.cwd(), ".env");
         let content = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf-8") : "";
-        const line = `TB_PREFIX="${value}"`;
+        const line = `TB_PREFIX=${JSON.stringify(value)}`;
         if (/^[ \t]*TB_PREFIX\s*=.*$/m.test(content)) {
           content = content.replace(/^[ \t]*TB_PREFIX\s*=.*$/m, line);
         } else {
